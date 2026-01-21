@@ -13,6 +13,8 @@ import argparse
 import time
 import io
 import sys
+import math
+import csv
 
 #We need to know if we are running on the Pi
 def is_raspberrypi():
@@ -75,6 +77,10 @@ reset = False
 too_fast = False
 MAX_RISE_C_PER_S = 2.0
 MAX_TEMP_THRESHOLD = 100
+start_time = time.monotonic()
+log_time = 0
+
+
 
 def maxtemp_warning(maxtemp):
     if maxtemp > MAX_TEMP_THRESHOLD:
@@ -107,20 +113,26 @@ def thermal_runaway_warning(maxtemp):
 
     return too_fast, rise_rate
 
-
+def log_data(timestamp, value):
+    with open('thermal_data.csv', 'a', newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow([timestamp, value])
 
 def rec():
 	now = time.strftime("%Y%m%d--%H%M%S")
 	#do NOT use mp4 here, it is flakey!
 	videoOut = cv2.VideoWriter(now+'output.avi', cv2.VideoWriter_fourcc(*'XVID'),25, (newWidth,newHeight))
 	return(videoOut)
- 
+
+
 while(cap.isOpened()):
 	# Capture frame-by-frame
+	clock = time.time()
 	ret, frame = cap.read()
 	if ret == True:
      
 		imdata,thdata = np.array_split(frame, 2)
+
 
 		hi_img = thdata[..., 1].astype(np.uint16)   # high byte
 		lo_img = thdata[..., 0].astype(np.uint16)   # low byte
@@ -151,9 +163,17 @@ while(cap.isOpened()):
 		avgtemp = round(float(avgtemp), 2)
 	
 
-		maxtemp_flag = maxtemp_warning(maxtemp)
-		too_fast, rise_rate = thermal_runaway_warning(maxtemp)
-		print_status(maxtemp, too_fast, rise_rate, avgtemp, maxtemp_flag)
+		# maxtemp_flag = maxtemp_warning(maxtemp)
+		# too_fast, rise_rate = thermal_runaway_warning(maxtemp)
+		# print_status(maxtemp, too_fast, rise_rate, avgtemp, maxtemp_flag)
+  
+		elapse = time.monotonic() - start_time
+
+		if elapse >= 30.0:
+			log_time = elapse + log_time
+			log_data(math.floor(log_time),maxtemp)
+			start_time = time.monotonic()
+			
 
 
 		# Convert the real image to RGB
@@ -220,6 +240,8 @@ while(cap.isOpened()):
 			cv2.FONT_HERSHEY_SIMPLEX, 0.45,(0,0,0), 2, cv2.LINE_AA)
 			cv2.putText(heatmap,str(maxtemp)+' C', ((mrow*scale)+10, (mcol*scale)+5),\
 			cv2.FONT_HERSHEY_SIMPLEX, 0.45,(0, 255, 255), 1, cv2.LINE_AA)
+
+			
 
 		#display floating min temp
 		if mintemp < avgtemp-threshold:
