@@ -36,6 +36,9 @@ Two independent warnings are produced:
    - Trigger: max temperature rise rate exceeds a limit
    - Default limit: `MAX_RISE_C_PER_S = 2.0` °C/s
    - Rise rate is updated when `dt >= 0.50 s` to reduce noisy flicker.
+   
+## Development Setup (VS Code)
+This project was developed and tested using **Visual Studio Code** for editing, debugging, and running the thermal detector script.
 
 ---
 ## Setup an venv
@@ -53,3 +56,15 @@ Install example:
 ```bash
 pip install opencv-python numpy
 pip install numpy
+```
+## Program Start
+Default device is 0 witch is the built-in webcamera. The Thermal camera is normaly device 4
+```bash
+./thermal_detector.py --device 4
+```
+## Tip
+To find the correct device uses this command below:
+```bash
+v4l2-ctl --list-devices
+```
+
