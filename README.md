@@ -38,7 +38,11 @@ Two independent warnings are produced:
    - Rise rate is updated when `dt >= 0.50 s` to reduce noisy flicker.
 
 ---
-
+## Setup an venv
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
 ## Requirements
 
 - Python 3
@@ -48,3 +52,4 @@ Two independent warnings are produced:
 Install example:
 ```bash
 pip install opencv-python numpy
+pip install numpy
