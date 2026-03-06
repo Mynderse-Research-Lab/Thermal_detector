@@ -15,7 +15,13 @@ import io
 import sys
 import math
 import csv
+from pathlib import Path
+current_timestamp = time.strftime("%Y-%m-%d_%H-%M-%S") #grab the date/time the file was made
+csv_file_name = f"thermal_data_{current_timestamp}.csv"
 
+script_dir = Path(__file__).parent #directory of current file
+data_folder_path = script_dir / "raw_thermal_data" 
+data_folder_path.mkdir(exist_ok=True)
 
 # We need to know if we are running on the Pi
 def is_raspberrypi(): #function definition: check if the raspberry pi is connected and able to be successfully opened.
@@ -79,7 +85,10 @@ def thermal_runaway_warning(maxtemp):
 
 
 def log_data(timestamp, maxTemp, avgTemp, roiMax, roiAvg): #log thermal data to a CSV file
-    with open("thermal_data.csv", "a", newline="") as file: #open a file called "thermal_data.csv" in append mode
+    #current_timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    #date_str = current_timestamp.replace(" ", "_")
+    csv_file_path = data_folder_path / csv_file_name
+    with open(csv_file_path, "a", newline="") as file: #open a file called "thermal_data_{date_str}.csv" in append mode, where date_str is the current day and time the file was made
         writer = csv.writer(file) #create a CSV writer object to write data to the file
         writer.writerow([timestamp, maxTemp, avgTemp, roiMax, roiAvg]) #write a new row to the CSV file
 
