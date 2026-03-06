@@ -15,13 +15,20 @@ import io
 import sys
 import math
 import csv
-from pathlib import Path
+import pygame #used for audio alerts
+from pathlib import Path #obtain script file path for data logging
 current_timestamp = time.strftime("%Y-%m-%d_%H-%M-%S") #grab the date/time the file was made
 csv_file_name = f"thermal_data_{current_timestamp}.csv"
 
 script_dir = Path(__file__).parent #directory of current file
 data_folder_path = script_dir / "raw_thermal_data" 
 data_folder_path.mkdir(exist_ok=True)
+
+#initialize audio altert system...determine if needed/appropriate implementation
+pygame.mixer.init() #initialize the pygame mixer for audio playback
+sound_path = script_dir / "audio_alert" / "beep_alert.mp3" #path to the audio alert file
+pygame.mixer.music.load(sound_path) #load the audio alert file
+#pygame.mixer.music.play(loops=-1) #play the audio alert in a loop
 
 # We need to know if we are running on the Pi
 def is_raspberrypi(): #function definition: check if the raspberry pi is connected and able to be successfully opened.
@@ -74,6 +81,11 @@ def thermal_runaway_warning(maxtemp):
                 reset = False #unset the reset flag
                 too_fast = (rise_rate > MAX_RISE_C_PER_S) #test if the rate of temp change is too fast by comparing to max rate threshold and set flag
 
+            #could audio alert reduce speed of data return? (Each time the alert plays, processing is delayed by 5 sec until audio finishes playing?)
+            '''
+            if too_fast and (not pygame.mixer.music.get_busy()): #if the rate of temp change is too fast and the audio alert is not currently playing
+                pygame.mixer.music.play(loops=1) #play the audio alert for a single loop
+            '''
             prev_maxtemp = maxtemp #update previous max temp to current max temp for next iteration
             prev_time = now #update previous time to current time for next iteration
 
