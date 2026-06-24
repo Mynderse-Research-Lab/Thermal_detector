@@ -15,7 +15,7 @@ import io
 import sys
 import math
 import csv
-import pygame #used for audio alerts
+#import pygame #used for audio alerts
 from pathlib import Path #obtain script file path for data logging
 current_timestamp = time.strftime("%Y-%m-%d_%H-%M-%S") #grab the date/time the file was made
 csv_file_name = f"thermal_data_{current_timestamp}.csv"
@@ -25,10 +25,30 @@ data_folder_path = script_dir / "raw_thermal_data"
 data_folder_path.mkdir(exist_ok=True)
 
 #initialize audio altert system...determine if needed/appropriate implementation
-pygame.mixer.init() #initialize the pygame mixer for audio playback
-sound_path = script_dir / "audio_alert" / "beep_alert.mp3" #path to the audio alert file
-pygame.mixer.music.load(sound_path) #load the audio alert file
+#pygame.mixer.init() #initialize the pygame mixer for audio playback
+#sound_path = script_dir / "audio_alert" / "beep_alert.mp3" #path to the audio alert file
+#pygame.mixer.music.load(sound_path) #load the audio alert file
 #pygame.mixer.music.play(loops=-1) #play the audio alert in a loop
+
+def detect_pack_region(img):
+    #convert to grayscale
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    #reduce noise
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    #detect edges
+    edges = cv2.Canny(blurred, 50, 150)
+    #find outlines/contours
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None, edges
+    #choose largest contour as likely battery pack
+    largest = max(contours, key=cv2.contourArea)
+    #ignore tiny detections
+    if cv2.contourArea(largest) < 1000:
+        return None, edges
+    #get bounding rectangle around pack
+    x, y, w, h = cv2.boundingRect(largest)
+    return (x, y, w, h), edges
 
 # We need to know if we are running on the Pi
 def is_raspberrypi(): #function definition: check if the raspberry pi is connected and able to be successfully opened.
@@ -218,8 +238,23 @@ while cap.isOpened(): #while the video capture device is successfully opened and
     if colormap == 0:
         heatmap = cv2.applyColorMap(bgr, cv2.COLORMAP_JET)
 
+    ##########################################################################
+    pack_bound, edges = detect_pack_region(bgr)
+    cv2.imshow("Edges", edges)
+    if pack_bound is not None:
+        px, py, pw, ph = pack_bound
+        cv2.rectangle(heatmap, (px, py), (px + pw, py + ph), (255, 255, 255), 2)
+
+        roi_x = px // scale
+        roi_y = py // scale
+        roi_w = pw // scale
+        roi_h = ph // scale
+    else:
+        roi_x, roi_y, roi_w, roi_h = 50, 50, 70, 30
+    ############################################################################
+
     # ROI definition (top-left x,y)
-    roi_x, roi_y, roi_w, roi_h = 50, 50, 70, 30 # <------------------------------------------------------------------- Change the ROI
+    #roi_x, roi_y, roi_w, roi_h = 50, 50, 70, 30 # <------------------------------------------------------------------- Change the ROI
 
     # ROI stats
     stats = roi_stats(temp_img, roi_x, roi_y, roi_w, roi_h)
