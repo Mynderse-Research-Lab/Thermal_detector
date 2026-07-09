@@ -36,7 +36,7 @@ def detect_pack_region(img):
     #reduce noise
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     #detect edges
-    edges = cv2.Canny(blurred, 50, 150)
+    edges = cv2.Canny(blurred, 5, 200) #cv2.Canny(image, T_lower, T_upper, aperture_size, L2Gradient)
     #find outlines/contours
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -44,7 +44,7 @@ def detect_pack_region(img):
     #choose largest contour as likely battery pack
     largest = max(contours, key=cv2.contourArea)
     #ignore tiny detections
-    if cv2.contourArea(largest) < 1000:
+    if cv2.contourArea(largest) < 5:
         return None, edges
     #get bounding rectangle around pack
     x, y, w, h = cv2.boundingRect(largest)
