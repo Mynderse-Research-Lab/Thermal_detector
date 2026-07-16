@@ -31,23 +31,30 @@ data_folder_path.mkdir(exist_ok=True)
 #pygame.mixer.music.play(loops=-1) #play the audio alert in a loop
 
 def detect_pack_region(img):
-    #convert to grayscale
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    #reduce noise
+    if img.ndim == 2:
+        gray = img
+    else:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    #detect edges
-    edges = cv2.Canny(blurred, 5, 200) #cv2.Canny(image, T_lower, T_upper, aperture_size, L2Gradient)
-    #find outlines/contours
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    edges = cv2.Canny(blurred, 5, 200)
+
+    contours, _ = cv2.findContours(
+        edges,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
     if not contours:
         return None, edges
-    #choose largest contour as likely battery pack
+
     largest = max(contours, key=cv2.contourArea)
-    #ignore tiny detections
-    if cv2.contourArea(largest) < 5:
+
+    if cv2.contourArea(largest) < 200:
         return None, edges
-    #get bounding rectangle around pack
+
     x, y, w, h = cv2.boundingRect(largest)
+
     return (x, y, w, h), edges
 
 # We need to know if we are running on the Pi
@@ -225,30 +232,94 @@ while cap.isOpened(): #while the video capture device is successfully opened and
     # Calculate elapsed time
     elapse = time.monotonic() - start_time
 
-    # Convert the real image to RGB for display
-    bgr = cv2.cvtColor(imdata, cv2.COLOR_YUV2BGR_YUYV)
-    bgr = cv2.convertScaleAbs(bgr, alpha=alpha)
-    bgr = cv2.resize(bgr, (newWidth, newHeight), interpolation=cv2.INTER_CUBIC)
+   # Dynamically normalize the decoded thermal data.
+    gray_display = cv2.normalize(
+        temp_img,
+        None,
+        0,
+        255,
+        cv2.NORM_MINMAX
+    ).astype(np.uint8)
 
-    if rad > 0:
-        bgr = cv2.blur(bgr, (rad, rad))
+    # Perform edge detection on the original grayscale thermal image.
+    pack_bound, edges = detect_pack_region(gray_display)
 
-    # Apply colormap
-    cmapText = "Jet"
+    # Create the JET version from the same grayscale data.
+    jet_display = cv2.applyColorMap(
+        gray_display,
+        cv2.COLORMAP_JET
+    )
+    '''
+    # Resize both views.
+    gray_large = cv2.resize(
+        gray_display,
+        (newWidth, newHeight),
+        interpolation=cv2.INTER_CUBIC
+    )
+
+    jet_large = cv2.resize(
+        jet_display,
+        (newWidth, newHeight),
+        interpolation=cv2.INTER_CUBIC
+    )
+
+    # Convert grayscale to BGR before combining.
+    # This gives both images the same number of channels.
+    gray_large_bgr = cv2.cvtColor(
+        gray_large,
+        cv2.COLOR_GRAY2BGR
+    )
+'''
+    # Preserve the heatmap variable for later display routines.
+    #heatmap = np.hstack(
+     #   (gray_large_bgr, jet_large)
+    #)
+    cmapText = "Grayscale"
     if colormap == 0:
-        heatmap = cv2.applyColorMap(bgr, cv2.COLORMAP_JET)
-
+        heatmap = cv2.applyColorMap(gray_display, cv2.COLORMAP_JET)
     ##########################################################################
-    pack_bound, edges = detect_pack_region(bgr)
-    cv2.imshow("Edges", edges)
-    if pack_bound is not None:
-        px, py, pw, ph = pack_bound
-        cv2.rectangle(heatmap, (px, py), (px + pw, py + ph), (255, 255, 255), 2)
+    #pack_bound, edges = detect_pack_region(bgr)
 
-        roi_x = px // scale
-        roi_y = py // scale
-        roi_w = pw // scale
-        roi_h = ph // scale
+
+    cv2.imshow("Edges", edges)
+
+    if pack_bound is not None:
+        # Coordinates are based on the original 256 x 192 image.
+        px, py, pw, ph = pack_bound
+
+        # Use original coordinates for temperature calculations.
+        roi_x = px
+        roi_y = py
+        roi_w = pw
+        roi_h = ph
+
+        # Scale coordinates only when drawing on the enlarged display.
+        display_x = px * scale
+        display_y = py * scale
+        display_w = pw * scale
+        display_h = ph * scale
+
+        # Draw detected pack boundary on the grayscale side.
+        cv2.rectangle(
+            heatmap,
+            (display_x, display_y),
+            (display_x + display_w, display_y + display_h),
+            (255, 255, 255),
+            2
+        )
+
+        # Draw the same boundary on the JET side.
+        cv2.rectangle(
+            heatmap,
+            (display_x + newWidth, display_y),
+            (
+                display_x + newWidth + display_w,
+                display_y + display_h
+            ),
+            (255, 255, 255),
+            2
+        )
+
     else:
         roi_x, roi_y, roi_w, roi_h = 50, 50, 70, 30
     ############################################################################

@@ -225,6 +225,11 @@ def camera_loop():
     if not camera.isOpened():
         print("ERROR: Could not open camera.")
         return
+    
+    display_min_temp = 15.0
+    display_max_temp = 50.0
+    initialization_frames = 0
+    INITIALIZATION_FRAME_COUNT = 25
 
     while camera.isOpened():
         try:
@@ -276,18 +281,70 @@ def camera_loop():
             # Calculate elapsed time
             #elapse = time.monotonic() - start_time
 
-            # Convert the real image to RGB for display
-            bgr = cv2.cvtColor(imdata, cv2.COLOR_YUV2BGR_YUYV)
-            bgr = cv2.convertScaleAbs(bgr, alpha=alpha)
-            bgr = cv2.resize(bgr, (newWidth, newHeight), interpolation=cv2.INTER_CUBIC)
+            # Allow the camera to stabilize before locking the display range.
+            initialization_frames += 1
+
+            if (
+                display_min_temp is None
+                and initialization_frames >= INITIALIZATION_FRAME_COUNT
+            ):
+                # Percentiles prevent one noisy pixel from defining the entire scale.
+                display_min_temp = float(np.percentile(temp_img, 2))
+                display_max_temp = float(np.percentile(temp_img, 98))
+
+                # Prevent a nearly uniform initial image from creating a tiny range.
+                if display_max_temp - display_min_temp < 5.0:
+                    display_max_temp = display_min_temp + 5.0
+
+                print(
+                    f"\nColormap locked at "
+                    f"{display_min_temp:.1f} to {display_max_temp:.1f} C"
+                )
+
+            # Use a temporary range while waiting for the initial lock.
+            if display_min_temp is None:
+                frame_min = float(np.percentile(temp_img, 2))
+                frame_max = float(np.percentile(temp_img, 98))
+
+                if frame_max - frame_min < 5.0:
+                    frame_max = frame_min + 5.0
+            else:
+                # These values remain fixed after initialization.
+                frame_min = display_min_temp
+                frame_max = display_max_temp
+
+            # Clip temperatures to the fixed display range.
+            clipped_temp = np.clip(
+                temp_img,
+                frame_min,
+                frame_max
+            )
+
+            # Convert temperature values to the 0–255 colormap range.
+            normalized_temp = (
+                (clipped_temp - frame_min)
+                / (frame_max - frame_min)
+                * 255.0
+            ).astype(np.uint8)
+
+            # Apply JET to the actual temperature data.
+            heatmap = cv2.applyColorMap(
+                normalized_temp,
+                cv2.COLORMAP_JET
+            )
+
+            heatmap = cv2.resize(
+                heatmap,
+                (newWidth, newHeight),
+                interpolation=cv2.INTER_CUBIC
+            )
 
             if rad > 0:
-                bgr = cv2.blur(bgr, (rad, rad))
+                heatmap = cv2.blur(heatmap, (rad, rad))
 
-            # Apply colormap
-            cmapText = "Jet"
-            if colormap == 0:
-                heatmap = cv2.applyColorMap(bgr, cv2.COLORMAP_JET)
+            cmapText = (
+                f"Jet {frame_min:.1f}-{frame_max:.1f} C"
+            )
 
             if not ret:
                 print("WARNING: Failed to read camera frame.")
