@@ -350,7 +350,7 @@ def camera_loop():
                 print("WARNING: Failed to read camera frame.")
                 time.sleep(0.1)
                 continue
-            
+            '''
             # ROI definition (top-left x,y)
             roi_x, roi_y, roi_w, roi_h = 50, 50, 70, 30 # <------------------------------------------------------------------- Change the ROI
 
@@ -364,6 +364,39 @@ def camera_loop():
             cv2.rectangle(heatmap, (sx, sy), (sx + sw, sy + sh), (0, 255, 0), 2)
             cv2.putText(heatmap, f"ROI max: {stats['max']:.1f} C", (sx, max(0, sy - 5)), cv2.FONT_HERSHEY_SIMPLEX,
                 0.45, (0, 255, 0), 1, cv2.LINE_AA)
+                '''
+            
+            # ROI size in the original 256 × 192 temperature image
+            roi_half_width = 20
+            roi_half_height = 20
+
+            # Keep the ROI inside temp_img
+            x1 = max(0, mcol - roi_half_width)
+            y1 = max(0, mrow - roi_half_height)
+            x2 = min(temp_img.shape[1], mcol + roi_half_width)
+            y2 = min(temp_img.shape[0], mrow + roi_half_height)
+
+            # Calculate statistics using ORIGINAL, unscaled coordinates
+            stats = roi_stats(
+                temp_img,
+                x1,
+                y1,
+                x2 - x1,
+                y2 - y1
+            )
+
+            # Scale coordinates only when drawing on the resized heatmap
+            top_left = (x1 * scale, y1 * scale)
+            bottom_right = (x2 * scale, y2 * scale)
+
+            cv2.rectangle(
+                heatmap,
+                top_left,
+                bottom_right,
+                (0, 255, 0),
+                2
+            )
+            #= roi_stats(temp_img, roi_x - 50, roi_y - 50, 100, 100)
             
             # Crosshairs
             cv2.line(heatmap, (newWidth // 2, newHeight // 2 + 20), (newWidth // 2, newHeight // 2 - 20), (255, 255, 255), 2)
@@ -494,12 +527,17 @@ app.layout = html.Div([
 )
 
 def update_stats_display(n_intervals, pack_type):
+    global too_fast, reset
     with frame_lock:
         stats = latest_stats.copy()
 
-    danger = stats["max_temp_warning"] or stats["thermal_runaway_warning"]
+    if too_fast:
+        status_text = f"DANGER / STOP"
+    else:
+        status_text = f"NORMAL"
+    #danger = stats["max_temp_warning"] or stats["thermal_runaway_warning"]
 
-    status_text = "DANGER / STOP" if danger else "Normal"
+    #status_text = "DANGER / STOP" if danger else "Normal"
 
     return html.Div([
         html.P(f"Selected Pack Type: {pack_type}"),
