@@ -1,6 +1,7 @@
 #dashboard for thermal camera monitoring
 from dash import Dash, dcc, html
 from dash.dependencies import Input, Output, State
+from collections import deque
 import plotly.graph_objs as go
 import csv
 import os
@@ -36,6 +37,7 @@ latest_frame = None
 latest_stats = {
     "max_temp": 0.0,
     "avg_temp": 0.0,
+    "center_temp": 0.0,
     "rise_rate": 0.0,
     "max_temp_warning": False,
     "thermal_runaway_warning": False,
@@ -43,11 +45,23 @@ latest_stats = {
     "roi_avg": 0.0,
 }
 
+GRAPH_HISTORY_LENGTH = 600
+
+center_temp_times = deque(maxlen=GRAPH_HISTORY_LENGTH)
+center_temp_values = deque(maxlen=GRAPH_HISTORY_LENGTH)
+
+graph_lock = threading.Lock()
+
 prev_maxtemp = None
 prev_time = None
 rise_rate = 0.0
 too_fast = False
-reset = False
+
+display_min_temp = 10.0
+display_max_temp = 50.0
+
+state_lock = threading.Lock()
+
 width = 256
 height = 192
 scale = 3
@@ -114,10 +128,31 @@ def maxtemp_warning(maxtemp):
 
 
 def thermal_runaway_warning(maxtemp):
-    global prev_maxtemp, prev_time, rise_rate, too_fast, reset #set global variables to track temperature info
+    global prev_maxtemp, prev_time, rise_rate, too_fast #set global variables to track temperature info
 
     now = time.time() #set current time from machine clock
 
+    with state_lock:
+        if prev_maxtemp is None or prev_time is None:
+            prev_maxtemp = maxtemp
+            prev_time = now
+            rise_rate = 0.0
+            return too_fast, rise_rate
+
+        dt = now - prev_time
+
+        if dt >= 0.50:
+            rise_rate = (maxtemp - prev_maxtemp) / dt
+
+            # Latch the warning once the threshold is exceeded.
+            if rise_rate > MAX_RISE_C_PER_S:
+                too_fast = True
+
+            prev_maxtemp = maxtemp
+            prev_time = now
+
+        return too_fast, rise_rate
+    '''
     if prev_maxtemp is not None: #if we have a previous max temp reading (this isn't the first iteration)
         dt = now - prev_time #difference in time = current time - previous time
 
@@ -129,10 +164,10 @@ def thermal_runaway_warning(maxtemp):
                 too_fast = (rise_rate > MAX_RISE_C_PER_S) #test if the rate of temp change is too fast by comparing to max rate threshold and set flag
 
             #could audio alert reduce speed of data return? (Each time the alert plays, processing is delayed by 5 sec until audio finishes playing?)
-            '''
-            if too_fast and (not pygame.mixer.music.get_busy()): #if the rate of temp change is too fast and the audio alert is not currently playing
-                pygame.mixer.music.play(loops=1) #play the audio alert for a single loop
-            '''
+            
+            #if too_fast and (not pygame.mixer.music.get_busy()): #if the rate of temp change is too fast and the audio alert is not currently playing
+             #   pygame.mixer.music.play(loops=1) #play the audio alert for a single loop
+            
             prev_maxtemp = maxtemp #update previous max temp to current max temp for next iteration
             prev_time = now #update previous time to current time for next iteration
 
@@ -141,6 +176,18 @@ def thermal_runaway_warning(maxtemp):
         prev_time = now #set previous time to current time to start tracking
 
     return too_fast, rise_rate #return the thermal runaway warning flag and the current rate of temperature change
+    '''
+
+def reset_camera_alarm_state():
+    global prev_maxtemp, prev_time, rise_rate, too_fast
+    with state_lock:
+        prev_maxtemp = None
+        prev_time = None
+        rise_rate = 0.0
+        too_fast = False
+
+
+
 
 def process_frame(frame):
     temp_img = frame_to_temp_array(frame)
@@ -204,13 +251,35 @@ def draw_overlay(frame, stats):
 
     return jet_frame
 
-def log_data(timestamp, maxTemp, avgTemp, roiMax, roiAvg): #log thermal data to a CSV file
+csv_headers = [
+    "Timestamp",
+    "Max Temp (C)",
+    "Avg Temp (C)",
+    "Center Temp (C)",
+    "ROI Max Temp (C)",
+    "ROI Avg Temp (C)", 
+    "Temp Rise Rate (C/s)",
+    "Max Temp Warning",
+    "Thermal Runaway Warning",
+]
+
+def initialize_csv():
+    csv_file_path = data_folder_path / csv_file_name
+
+    if not csv_file_path.exists() or csv_file_path.stat().st_size == 0:
+        with open(csv_file_path, "w", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(csv_headers)
+
+
+
+def log_data(timestamp, maxTemp, avgTemp,centerTemp, roiMax, roiAvg, riseRate, maxTempFlag, runawayFlag): #log thermal data to a CSV file
     #current_timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
     #date_str = current_timestamp.replace(" ", "_")
     csv_file_path = data_folder_path / csv_file_name
     with open(csv_file_path, "a", newline="") as file: #open a file called "thermal_data_{date_str}.csv" in append mode, where date_str is the current day and time the file was made
         writer = csv.writer(file) #create a CSV writer object to write data to the file
-        writer.writerow([timestamp, maxTemp, avgTemp, roiMax, roiAvg]) #write a new row to the CSV file
+        writer.writerow([timestamp, maxTemp, avgTemp, centerTemp, roiMax, roiAvg, riseRate, maxTempFlag, runawayFlag]) #write a new row to the CSV file
 
 def camera_loop():
     global latest_frame, latest_stats
@@ -225,11 +294,16 @@ def camera_loop():
     if not camera.isOpened():
         print("ERROR: Could not open camera.")
         return
-    
+
+
+    last_graph_sample_time=0.0
+    GRAPH_SAMPLE_INTERVAL = 0.5
+    '''
     display_min_temp = 15.0
     display_max_temp = 50.0
     initialization_frames = 0
     INITIALIZATION_FRAME_COUNT = 25
+    '''
 
     while camera.isOpened():
         try:
@@ -248,9 +322,15 @@ def camera_loop():
             raw_img = (hi_img << 8) | lo_img
 
             # Center pixel temp
-            rawtemp = raw_img[96, 128]
-            temp = (rawtemp / 64.0) - 273.15
-            temp = round(float(temp), 2)
+            #rawtemp = raw_img[96, 128]
+            center_row = raw_img.shape[0] // 2
+            center_col = raw_img.shape[1] // 2
+
+            rawtemp = raw_img[center_row, center_col]
+            center_temp = (rawtemp / 64.0) - 273.15
+            center_temp = round(float(center_temp), 2)
+            #temp = (rawtemp / 64.0) - 273.15
+            #temp = round(float(temp), 2)
 
             # Full temp image (°C) per pixel
             temp_img = (raw_img.astype(np.float32) / 64.0) - 273.15
@@ -277,12 +357,20 @@ def camera_loop():
             maxtemp_flag = maxtemp_warning(maxtemp)
             too_fast, rise_rate = thermal_runaway_warning(maxtemp)
             print_status(maxtemp, too_fast, rise_rate, avgtemp, maxtemp_flag)
-            
+
+            # Copy the current slider settings while holding the lock briefly.
+            with state_lock:
+                frame_min = float(display_min_temp)
+                frame_max = float(display_max_temp)
+
+            # Extra protection against an invalid or zero-width range.
+            if frame_max <= frame_min:
+                frame_max = frame_min + 0.5
             # Calculate elapsed time
             #elapse = time.monotonic() - start_time
 
             # Allow the camera to stabilize before locking the display range.
-            initialization_frames += 1
+            '''initialization_frames += 1
 
             if (
                 display_min_temp is None
@@ -312,7 +400,7 @@ def camera_loop():
                 # These values remain fixed after initialization.
                 frame_min = display_min_temp
                 frame_max = display_max_temp
-
+            '''
             # Clip temperatures to the fixed display range.
             clipped_temp = np.clip(
                 temp_img,
@@ -406,8 +494,8 @@ def camera_loop():
 
             # Center temp text
             cx, cy = newWidth // 2, newHeight // 2
-            cv2.putText(heatmap, f"{temp} C", (cx + 10, cy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
-            cv2.putText(heatmap, f"{temp} C", (cx + 10, cy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(heatmap, f"{center_temp} C", (cx + 10, cy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(heatmap, f"{center_temp} C", (cx + 10, cy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
 
             # HUD
             if hud:
@@ -439,18 +527,27 @@ def camera_loop():
             dashboard_stats = {
                 "max_temp": maxtemp,
                 "avg_temp": avgtemp,
+                "center_temp": center_temp,
                 "rise_rate": rise_rate,
                 "max_temp_warning": maxtemp_flag,
                 "thermal_runaway_warning": too_fast,
                 "roi_max": stats["max"],
                 "roi_avg": stats["mean"],
             }
+            current_time = time.time()
+
+            if current_time - last_graph_sample_time >= GRAPH_SAMPLE_INTERVAL:
+                with graph_lock:
+                    center_temp_times.append(datetime.now())
+                    center_temp_values.append(center_temp)
+
+                    last_graph_sample_time = current_time
 
             with frame_lock:
                 latest_frame = heatmap
                 latest_stats = dashboard_stats
 
-            log_data(datetime.now().isoformat(timespec="seconds"), dashboard_stats["max_temp"], dashboard_stats["avg_temp"], dashboard_stats["roi_max"], dashboard_stats["roi_avg"])
+            log_data(datetime.now().isoformat(timespec="milliseconds"), dashboard_stats["max_temp"], dashboard_stats["avg_temp"], dashboard_stats["center_temp"], dashboard_stats["roi_max"], dashboard_stats["roi_avg"], dashboard_stats["rise_rate"], dashboard_stats["max_temp_warning"], dashboard_stats["thermal_runaway_warning"])
 
             time.sleep(0.05)
         except Exception as e:
@@ -505,8 +602,23 @@ app.layout = html.Div([
             "display": "block",
             "border": "2px solid black"
         }),
+    html.Div([dcc.Button('Reset', id='reset-alarm-button', n_clicks = 0),
+                  html.Span(id="reset-status", style={"marginLeft": "12px"}),],
+                  style={"marginTop": "15px", "marginBottom": "20px"}),
+    html.Div([html.Label("colormap minimum tempterature", style={"fontWeight":"bold"}),
+              dcc.Slider(0, 50, 0.5, value=10, marks=None, tooltip={"placement":"bottom", "always_visible":True}, id='display-min-slider'),
+              html.Div(id="display-min-label")], style={"marginBottom": "25px"}),
+    html.Div([html.Label("colormap maximum temperature", style={"fontWeight": "bold"}),
+            dcc.Slider(40, 150, 0.5, value=50, marks=None, tooltip={"placement":"bottom", "always_visible":True}, id='display-max-slider'),
+            html.Div(id="display-max-label"),
+         ], style={"marginBottom": "25px"}),
+    html.Div(id="slider-output-container-2"),
     html.H2("Thermal Stats"),
     html.Div(id="stats-display"),
+    html.H2("Center Temperature (deg C)"),
+    dcc.Graph(id="center-temperature-graph",
+              config={"displayModeBar":True,"scrollZoom":False},
+              style={"width": "100%", "height":"450px"}),
     dcc.Interval(
         id="stats-update-interval",
         interval=500,
@@ -521,13 +633,60 @@ app.layout = html.Div([
 })
 
 @app.callback(
-        Output('stats-display', 'children'),
-        Input("stats-update-interval", "n_intervals"),
-        Input('pack-type-dropdown', 'value')
+    Output("display-min-label", "children"),
+    Output("display-max-label", "children"),
+    Input("display-min-slider", "value"),
+    Input("display-max-slider", "value"),
+)
+def update_display_range(minimum_temp, maximum_temp):
+    global display_min_temp, display_max_temp
+
+    if minimum_temp is None:
+        minimum_temp = 10.0
+
+    if maximum_temp is None:
+        maximum_temp = 50.0
+
+    minimum_temp = float(minimum_temp)
+    maximum_temp = float(maximum_temp)
+
+    if maximum_temp <= minimum_temp:
+        return (
+            f"Minimum: {minimum_temp:.1f} °C",
+            "Maximum must be greater than the minimum."
+        )
+
+    with state_lock:
+        display_min_temp = minimum_temp
+        display_max_temp = maximum_temp
+
+    return (
+        f"Minimum: {minimum_temp:.1f} °C",
+        f"Maximum: {maximum_temp:.1f} °C"
+    )
+
+@app.callback(
+    Output("reset-status", "children"),
+    Input("reset-alarm-button", "n_clicks"),
+    prevent_initial_call=True,
+)
+def reset_alarm(n_clicks):
+    reset_camera_alarm_state()
+
+    return (
+        #f"Alarm reset at "
+        #f"{datetime.now().strftime('%H:%M:%S')}"
+    )
+
+@app.callback(
+    Output("stats-display", "children"),
+    Input("stats-update-interval", "n_intervals"),
+    Input("pack-type-dropdown", "value"),
 )
 
+
 def update_stats_display(n_intervals, pack_type):
-    global too_fast, reset
+    global too_fast
     with frame_lock:
         stats = latest_stats.copy()
 
@@ -542,16 +701,54 @@ def update_stats_display(n_intervals, pack_type):
     return html.Div([
         html.P(f"Selected Pack Type: {pack_type}"),
         html.P(f"System Status: {status_text}"),
-        html.P(f"Max Temperature: {stats['max_temp']:.2f} °C"),
-        html.P(f"Average Temperature: {stats['avg_temp']:.2f} °C"),
-        html.P(f"Temperature Rise Rate: {stats['rise_rate']:.2f} °C/s"),
+        html.P(f"Max Temperature: {stats['max_temp']:.2f} deg C"),
+        html.P(f"Average Temperature: {stats['avg_temp']:.2f} deg C"),
+        htmp.P(f"Center Temperature: {stats['center_temp']:.2f} deg C"),
+        html.P(f"Temperature Rise Rate: {stats['rise_rate']:.2f} deg C/s"),
         html.P(f"Max Temp Warning: {stats['max_temp_warning']}"),
         html.P(f"Thermal Runaway Warning: {stats['thermal_runaway_warning']}"),
-        html.P(f"Test ROI Max Temperature: {stats['roi_max']:.2f} °C"),
-        html.P(f"Test ROI Average Temperature: {stats['roi_avg']:.2f} °C"),
+        html.P(f"Test ROI Max Temperature: {stats['roi_max']:.2f} deg C"),
+        html.P(f"Test ROI Average Temperature: {stats['roi_avg']:.2f} deg C"),
     ])
 
+@app.callback(
+    Output("center-temperature-graph", "figure"),
+    Input("stats-update-interval", "n_intervals"),
+)
+def update_center_temperature_graph(n_intervals):
+    with graph_lock:
+        times = list(center_temp_times)
+        temperatures = list(center_temp_values)
+
+    figure = go.Figure()
+
+    figure.add_trace(
+        go.Scatter(
+            x=times,
+            y=temperatures,
+            mode="lines",
+            name="Center temperature",
+        )
+    )
+
+    figure.update_layout(
+        title="Center Temperature vs. Time",
+        xaxis_title="Time",
+        yaxis_title="Temperature (°C)",
+        margin={
+            "l": 60,
+            "r": 30,
+            "t": 55,
+            "b": 55,
+        },
+        uirevision="center-temperature-history",
+    )
+
+    return figure
+
 if __name__ == '__main__':
+    initialize_csv()
+    
     camera_thread = threading.Thread(target=camera_loop, daemon=True)
     camera_thread.start()
     app.run(host="0.0.0.0", port=8050, debug=False)
