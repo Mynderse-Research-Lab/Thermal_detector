@@ -21,8 +21,8 @@ from pathlib import Path
 #and partition and monitor the battery pack temperature
 MAX_RISE_C_PER_S = 2.0
 MAX_TEMP_THRESHOLD = 100
-CAMERA_INDEX=0
-
+THERMAL_CAMERA_INDEX=2
+RGB_CAMERA_INDEX=0
 
 
 current_timestamp = time.strftime("%Y-%m-%d_%H-%M-%S") #grab the date/time the file was made
@@ -284,7 +284,7 @@ def log_data(timestamp, maxTemp, avgTemp,centerTemp, roiMax, roiAvg, riseRate, m
 def camera_loop():
     global latest_frame, latest_stats
 
-    camera = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
+    camera = cv2.VideoCapture(THERMAL_CAMERA_INDEX, cv2.CAP_V4L2)
     camera.set(cv2.CAP_PROP_CONVERT_RGB, 0)
     camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('Y', 'U', 'Y','V'))
     camera.set(cv2.CAP_PROP_FRAME_WIDTH, 256)
@@ -535,10 +535,11 @@ def camera_loop():
                 "roi_avg": stats["mean"],
             }
             current_time = time.time()
+            sample_timestamp = datetime.now()
 
             if current_time - last_graph_sample_time >= GRAPH_SAMPLE_INTERVAL:
                 with graph_lock:
-                    center_temp_times.append(datetime.now())
+                    center_temp_times.append(sample_timestamp)
                     center_temp_values.append(center_temp)
 
                     last_graph_sample_time = current_time
@@ -547,14 +548,24 @@ def camera_loop():
                 latest_frame = heatmap
                 latest_stats = dashboard_stats
 
-            log_data(datetime.now().isoformat(timespec="milliseconds"), dashboard_stats["max_temp"], dashboard_stats["avg_temp"], dashboard_stats["center_temp"], dashboard_stats["roi_max"], dashboard_stats["roi_avg"], dashboard_stats["rise_rate"], dashboard_stats["max_temp_warning"], dashboard_stats["thermal_runaway_warning"])
+            log_data(sample_timestamp.isoformat(timespec="milliseconds"), dashboard_stats["max_temp"], dashboard_stats["avg_temp"], dashboard_stats["center_temp"], dashboard_stats["roi_max"], dashboard_stats["roi_avg"], dashboard_stats["rise_rate"], dashboard_stats["max_temp_warning"], dashboard_stats["thermal_runaway_warning"])
 
             time.sleep(0.05)
         except Exception as e:
             print("ERROR in camera_loop:", e)
             time.sleep(1)
 
-
+def generate_rgb_stream():
+    while True:
+        jpeg = rgb_camera.get_jpeg()
+        if jpeg is None:
+            time.sleep(0.05)
+            continue
+        yield(
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n"+jpeg+b"\r\n"
+        )
+        time.sleep(0.03)
 
 def generate_video_stream():
     while True:
@@ -580,12 +591,69 @@ server = Flask(__name__)
 app = Dash(__name__, server=server)
 
 @server.route("/video_feed")
-
 def video_feed():
     return Response(
         generate_video_stream(),
         mimetype="multipart/x-mixed-replace; boundary=frame"
     )
+
+@server.route("/rgb-video-feed")
+def rgb_video_feed():
+    return Response(
+        generate_rgb_stream(),
+        mimetype="multipart/x-mixed-replace; boundary=frame"
+    )
+
+class RGBCamera:
+    def __init__(self, camera_index=0):
+        self.camera_index = RGB_CAMERA_INDEX
+        self.capture = None
+        self.latest_frame = None
+        self. lock = threading.Lock()
+        self.running = False
+        self.thread = None
+
+    def start(self):
+        if self.running:
+            return
+
+        self.capture = cv2.VideoCapture(self.camera_index, cv2.CAP_V4L2)
+        if not self.capture.isOpened():
+            raise RuntimeError(f"Could not open RGB Camera {self.camera_index}")
+        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        self.capture.set(cv2.CAP_PROP_FPS, 30)
+
+        self.running = True
+        self.thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.thread.start()
+        print(f"RGB Camera started")
+
+    def _capture_loop(self):
+        while self.running:
+            success, frame = self.capture.read()
+            if success:
+                with self.lock:
+                    self.latest_frame = frame.copy()
+            else:
+                print("Unable to read RGB Camera frame")
+                time.sleep(0.1)
+    def get_jpeg(self):
+        with self.lock:
+            if self.latest_frame is None:
+                return None
+            frame = self.latest_frame.copy()
+        success, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if not success:
+            return None
+        return jpeg.tobytes()
+    def stop(self):
+        self.running=False
+        if self.thread is not None:
+            self.thread.join(timeout=1)
+        if self.capture is not None:
+            self.capture.release()
+
 
 app.layout = html.Div([
     html.H1("Thermal Camera Input & Measurements"),
@@ -595,13 +663,29 @@ app.layout = html.Div([
     html.Img(
         src="/video_feed",
         style={
-            "width": "75%",
+            "width": "50%",
             "height": "auto",
             "maxHeight": "80vh",
             "objectFit": "contain",
             "display": "block",
             "border": "2px solid black"
         }),
+    html.Div([html.H3("RGB Camera"), 
+              html.Img(
+                  src="/rgb-video-feed",
+                  style={
+                      "width":"100%",
+                      "maxWidth":"900px",
+                      "height":"auto",
+                      "border":"2px solid #333",
+                      "borderRadius":"6px"
+                  }
+              )],
+              style={
+                    "padding":"10px",
+                    "textAlign":"center"
+              }),
+    html.Div(id="runaway_notification", style={"display":"none"}),
     html.Div([dcc.Button('Reset', id='reset-alarm-button', n_clicks = 0),
                   html.Span(id="reset-status", style={"marginLeft": "12px"}),],
                   style={"marginTop": "15px", "marginBottom": "20px"}),
@@ -680,6 +764,8 @@ def reset_alarm(n_clicks):
 
 @app.callback(
     Output("stats-display", "children"),
+    Output("runaway_notification", "children"),
+    Output("runaway_notification", "style"),
     Input("stats-update-interval", "n_intervals"),
     Input("pack-type-dropdown", "value"),
 )
@@ -690,6 +776,26 @@ def update_stats_display(n_intervals, pack_type):
     with frame_lock:
         stats = latest_stats.copy()
 
+    runaway_active = stats["thermal_runaway_warning"]
+
+    if runaway_active:
+        notification_text = "THERMAL RUNAWAY ACTIVE - STOP"
+        notification_style = {
+            "display": "block",
+            "backgroundColor": "#b00020",
+            "color": "white",
+            "fontSize": "24px",
+            "fontWeight": "bold",
+            "textAlign": "center",
+            "padding": "15px",
+            "marginBottom": "15px",
+            "border": "4px solid #5c000f",
+            "borderRadius": "6px"
+        }
+    else:
+        notification_text = ""
+        notification_style = {"display": "none"}
+
     if too_fast:
         status_text = f"DANGER / STOP"
     else:
@@ -698,18 +804,20 @@ def update_stats_display(n_intervals, pack_type):
 
     #status_text = "DANGER / STOP" if danger else "Normal"
 
-    return html.Div([
+    stats_display = html.Div([
         html.P(f"Selected Pack Type: {pack_type}"),
         html.P(f"System Status: {status_text}"),
         html.P(f"Max Temperature: {stats['max_temp']:.2f} deg C"),
         html.P(f"Average Temperature: {stats['avg_temp']:.2f} deg C"),
-        htmp.P(f"Center Temperature: {stats['center_temp']:.2f} deg C"),
+        html.P(f"Center Temperature: {stats['center_temp']:.2f} deg C"),
         html.P(f"Temperature Rise Rate: {stats['rise_rate']:.2f} deg C/s"),
         html.P(f"Max Temp Warning: {stats['max_temp_warning']}"),
         html.P(f"Thermal Runaway Warning: {stats['thermal_runaway_warning']}"),
         html.P(f"Test ROI Max Temperature: {stats['roi_max']:.2f} deg C"),
         html.P(f"Test ROI Average Temperature: {stats['roi_avg']:.2f} deg C"),
     ])
+
+    return stats_display, notification_text, notification_style
 
 @app.callback(
     Output("center-temperature-graph", "figure"),
@@ -728,12 +836,21 @@ def update_center_temperature_graph(n_intervals):
             y=temperatures,
             mode="lines",
             name="Center temperature",
+            hovertemplate=(
+                "Time: %{x|%Y-%m-%d %H:%M:%S.%L}<br>"
+                "Center temperature: %{y:.2f} deg C"
+                "<extra></extra>"
+            )
         )
     )
 
     figure.update_layout(
         title="Center Temperature vs. Time",
-        xaxis_title="Time",
+        xaxis={"title":"Time",
+                     "type":"date",
+                     "tickformat":"%H:%M:%S.%L",
+                     "hoverformat":"%Y-%m-%d %H:%M:%S.%L"
+                     },
         yaxis_title="Temperature (°C)",
         margin={
             "l": 60,
@@ -751,4 +868,9 @@ if __name__ == '__main__':
     
     camera_thread = threading.Thread(target=camera_loop, daemon=True)
     camera_thread.start()
-    app.run(host="0.0.0.0", port=8050, debug=False)
+    rgb_camera = RGBCamera(camera_index=0)
+    rgb_camera.start()
+    try:
+        app.run(host="0.0.0.0", port=8050, debug=False)
+    finally:
+        rgb_camera.stop()
