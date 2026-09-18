@@ -100,6 +100,9 @@ def frame_to_temp_array(frame):
     temp_img = 20.0 + (gray.astype(np.float32) / 255.0) * 80.0
     return temp_img
 
+#def read_calib_coord():
+ #   with open('dual-cam_transform-coord.json', 'r',)
+
 def print_status(maxtemp, too_fast, rise_rate, avgtemp, maxtemp_flag): #function definitition: print the status of the thermal detector to the console
     sys.stdout.write( #write the following information to the console
         f"\rMax Temp Warning: {maxtemp:.2f} C | Flag: {maxtemp_flag} | limit: {MAX_TEMP_THRESHOLD}\n"
@@ -659,32 +662,45 @@ app.layout = html.Div([
     html.H1("Thermal Camera Input & Measurements"),
     html.Div([html.Label("Pack type:", style={"fontWeight": "bold", "marginRight": "8px"}),
               dcc.Dropdown(['Jeep Wrangler PHEV', 'Ford Maverick HEV', 'Fiat 500e BEV'], 'Jeep Wrangler PHEV', id='pack-type-dropdown', closeOnSelect = True, searchable=False, multi=False), html.Div(id='dropdown-output')], style={"width":"400px", "marginBottom":"20px"}),
-    html.H2("Live Thermal Camera Input"),
-    html.Img(
-        src="/video_feed",
-        style={
-            "width": "50%",
-            "height": "auto",
-            "maxHeight": "80vh",
-            "objectFit": "contain",
-            "display": "block",
-            "border": "2px solid black"
-        }),
-    html.Div([html.H3("RGB Camera"), 
-              html.Img(
-                  src="/rgb-video-feed",
+   html.H2("Live Cam Feed"),
+    html.Div([
+        html.Div([ html.H3("Thermal Camera", style={"textAlign":"center"}),
+            html.Img(
+            src="/video_feed",
+            style={
+                "width": "100%",
+                "height": "auto",
+                "maxHeight": "80vh",
+                "objectFit": "contain",
+                "display": "block",
+                "border": "2px solid #333",
+                "borderRadius":"6px"
+            })],
+            style={"flex":"1","minWidth":"350px"}
+            ),
+        html.Div([html.H3("RGB Camera", style={"textAlign":"center"}), 
+                  html.Img(
+                      src="/rgb-video-feed",
+                      style={
+                          "width":"100%",
+                          "maxWidth":"900px",
+                          "height":"auto",
+                          "maxHeight":"80vh",
+                          "objectFit":"contain",
+                          "display":"block",
+                          "border":"2px solid #333",
+                          "borderRadius":"6px"
+                      }
+                  )],
+                  style={"flex":"1","minWidth":"0"})],
                   style={
-                      "width":"100%",
-                      "maxWidth":"900px",
-                      "height":"auto",
-                      "border":"2px solid #333",
-                      "borderRadius":"6px"
-                  }
-              )],
-              style={
-                    "padding":"10px",
-                    "textAlign":"center"
-              }),
+                      "display": "flex",
+                      "flexDirection": "row",
+                      "alignItems": "flex-start",
+                      "gap": "20px",
+                      "width": "100%",
+                      "flexWrap": "nowrap"
+                  }),  
     html.Div(id="runaway_notification", style={"display":"none"}),
     html.Div([dcc.Button('Reset', id='reset-alarm-button', n_clicks = 0),
                   html.Span(id="reset-status", style={"marginLeft": "12px"}),],
