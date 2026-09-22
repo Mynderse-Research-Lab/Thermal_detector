@@ -24,6 +24,36 @@ MAX_TEMP_THRESHOLD = 100
 THERMAL_CAMERA_INDEX=2
 RGB_CAMERA_INDEX=0
 
+rgb_points = np.float32([
+    [465, 102],
+    [863, 85],
+    [467, 153],
+    [862, 147]
+])
+
+thermal_points = np.float32([
+    [70, 60],
+    [141, 58],
+    [70, 70],
+    [141, 68]
+])
+
+
+
+thermal_to_rgb_matrix, calibration_mask = cv2.findHomography(
+    thermal_points, rgb_points, method=cv2.RANSAC, ransacReprojThreshold=3.0)
+
+if thermal_to_rgb_matrix is None:
+    raise RuntimeError("Could not calculate thermal-to-RGB homography")
+
+projected_hotspot_lock = threading.Lock()
+#latest_projected_rgb_roi = None
+latest_projected_rgb_hotspot = None
+
+RGB_X_OFFSET = 0
+RGB_Y_OFFSET = 0
+RGB_ROI_HALF_WIDTH = 100
+RGB_ROI_HALF_HEIGHT = 100
 
 current_timestamp = time.strftime("%Y-%m-%d_%H-%M-%S") #grab the date/time the file was made
 csv_file_name = f"thermal_data_{current_timestamp}.csv"
@@ -75,6 +105,11 @@ threshold = 2
 
 TEST_ROI = (100, 100, 200, 150)
 
+def map_thermal_points_to_rgb(thermal_points):
+    points = np.asarray(thermal_points, dtype=np.float32).reshape(-1,1,2)
+    rgb_points = cv2.perspectiveTransform(points, thermal_to_rgb_matrix)
+    return rgb_points.reshape(-1,2)
+
 def detect_pack_region(img):
     #convert to grayscale
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -99,6 +134,25 @@ def frame_to_temp_array(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     temp_img = 20.0 + (gray.astype(np.float32) / 255.0) * 80.0
     return temp_img
+
+
+
+rgb_to_thermal, inlier_mask = cv2.findHomography(rgb_points, thermal_points, method=cv2.RANSAC, ransacReprojThreshold=3.0)
+if rgb_to_thermal is None:
+    raise RuntimeError("Could not calculate RGB to Thermal transformation")
+
+def map_rgb_to_thermal(rgb_points):
+    points = np.asarray(rgb_points, dtype=np.float32).reshape(-1,1,2)
+    thermal_points = cv2.perspectiveTransform(points, rgb_to_thermal)
+    return thermal_points.reshape(-1,2)
+
+scale=3
+def draw_thermal_detection(heatmap, thermal_polygon, label="Detected module"):
+    display_polygon = np.round(thermal_polygon * scale).astype(np.int32)
+    cv2.polylines(heatmap, [display_polygon], isCLosed=True, color=(255, 255, 255), thickness = 3, lineType = cv2.LINE_AA)
+    label_x = int(display_polygon[0][0])
+    label_y = int(display_polygon[0][1])
+    cv2.putText(heatmap, label, (label_x, max(label_y - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 2, cv2.LINE_AA)
 
 #def read_calib_coord():
  #   with open('dual-cam_transform-coord.json', 'r',)
@@ -243,7 +297,11 @@ def draw_overlay(frame, stats):
         color = (0, 255, 0)
 
     cv2.rectangle(jet_frame, (x, y), (x + w, y + h), color, 2)
-
+    thermal_coordinate_text = (f"Thermal:({x}, {y})")
+    coordinate_y = y+h+25
+    coordinate_x = max(5, min(x, newWidth-10))
+    coordinate_y = max(20, min(coordinate_y, newHeight-10))
+    cv2.putText(jet_frame, thermal_coordinate_text, (coordinate_x, coordinate_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2, cv2.LINE_AA)
     cv2.putText(jet_frame,f"ROI Max: {stats['roi_max']:.1f} C", (x, max(y-10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
     cv2.putText(jet_frame, f"Max: {stats['max_temp']:.1f} C", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
@@ -286,6 +344,8 @@ def log_data(timestamp, maxTemp, avgTemp,centerTemp, roiMax, roiAvg, riseRate, m
 
 def camera_loop():
     global latest_frame, latest_stats
+    #global latest_projected_rgb_roi
+    global latest_projected_rgb_hotspot
 
     camera = cv2.VideoCapture(THERMAL_CAMERA_INDEX, cv2.CAP_V4L2)
     camera.set(cv2.CAP_PROP_CONVERT_RGB, 0)
@@ -430,6 +490,11 @@ def camera_loop():
                 interpolation=cv2.INTER_CUBIC
             )
 
+            #thermal_polygon = map_rgb_to_thermal(rgb_detection_polygon)
+            #draw_thermal_detection(heatmap, thermal_polygon, label="RGB Detection")
+
+
+                
             if rad > 0:
                 heatmap = cv2.blur(heatmap, (rad, rad))
 
@@ -466,6 +531,21 @@ def camera_loop():
             y1 = max(0, mrow - roi_half_height)
             x2 = min(temp_img.shape[1], mcol + roi_half_width)
             y2 = min(temp_img.shape[0], mrow + roi_half_height)
+
+            #thermal_roi_polygon = np.float32([
+             #   [x1,y1],
+              #  [x2,y1],
+               # [x2,y2],
+                #[x1,y2]
+            #])
+            #projected_rgb_roi = map_thermal_points_to_rgb(thermal_roi_polygon)
+            projected_rgb_hotspot = map_thermal_points_to_rgb([[mcol, mrow]])[0]
+            projected_rgb_hotspot[0] += RGB_X_OFFSET
+            projected_rgb_hotspot[1] += RGB_Y_OFFSET
+            with projected_hotspot_lock:
+                #latest_projected_rgb_roi=projected_rgb_roi.copy()
+                latest_projected_rgb_hotspot = (projected_rgb_hotspot.copy())
+
 
             # Calculate statistics using ORIGINAL, unscaled coordinates
             stats = roi_stats(
@@ -609,10 +689,10 @@ def rgb_video_feed():
 
 class RGBCamera:
     def __init__(self, camera_index=0):
-        self.camera_index = RGB_CAMERA_INDEX
+        self.camera_index = camera_index
         self.capture = None
         self.latest_frame = None
-        self. lock = threading.Lock()
+        self.lock = threading.Lock()
         self.running = False
         self.thread = None
 
@@ -646,10 +726,123 @@ class RGBCamera:
             if self.latest_frame is None:
                 return None
             frame = self.latest_frame.copy()
+        with projected_hotspot_lock:
+            if latest_projected_rgb_hotspot is None:
+                projected_hotspot = None
+            else:
+                projected_hotspot = (latest_projected_rgb_hotspot.copy())
+        frame_height, frame_width = frame.shape[:2]
+        if projected_hotspot is not None:
+            hot_x = int(
+                round(projected_hotspot[0])
+            )
+            hot_y = int(
+                round(projected_hotspot[1])
+            )
+
+            if (
+                0 <= hot_x < frame_width
+                and 0 <= hot_y < frame_height
+            ):
+                # Create an RGB bounding box centered around the
+                # transformed hottest thermal pixel.
+                rgb_x1 = max(
+                    0,
+                    hot_x - RGB_ROI_HALF_WIDTH
+                )
+
+                rgb_y1 = max(
+                    0,
+                    hot_y - RGB_ROI_HALF_HEIGHT
+                )
+
+                rgb_x2 = min(
+                    frame_width - 1,
+                    hot_x + RGB_ROI_HALF_WIDTH
+                )
+
+                rgb_y2 = min(
+                    frame_height - 1,
+                    hot_y + RGB_ROI_HALF_HEIGHT
+                )
+
+                # Draw the RGB ROI box.
+                cv2.rectangle(
+                    frame,
+                    (rgb_x1, rgb_y1),
+                    (rgb_x2, rgb_y2),
+                    (0, 255, 0),
+                    4
+                )
+
+                # Draw a crosshair at the transformed hottest pixel.
+                cv2.drawMarker(
+                    frame,
+                    (hot_x, hot_y),
+                    color=(0, 0, 255),
+                    markerType=cv2.MARKER_CROSS,
+                    markerSize=30,
+                    thickness=3,
+                    line_type=cv2.LINE_AA
+                )
+
+                cv2.circle(
+                    frame,
+                    (hot_x, hot_y),
+                    6,
+                    (0, 0, 255),
+                    2,
+                    cv2.LINE_AA
+                )
+
+                cv2.putText(
+                    frame,
+                    "Projected thermal hotspot",
+                    (
+                        rgb_x1,
+                        max(rgb_y1 - 12, 25)
+                    ),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA
+                )
+
+                cv2.putText(
+                    frame,
+                    f"RGB: ({hot_x}, {hot_y})",
+                    (
+                        rgb_x1,
+                        min(
+                            rgb_y2 + 28,
+                            frame_height - 10
+                        )
+                    ),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA
+                )
+
+            else:
+                cv2.putText(
+                    frame,
+                    "Hottest point outside RGB field of view",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 0, 255),
+                    2,
+                    cv2.LINE_AA
+                )
+
         success, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
         if not success:
             return None
         return jpeg.tobytes()
+    
     def stop(self):
         self.running=False
         if self.thread is not None:
@@ -884,7 +1077,7 @@ if __name__ == '__main__':
     
     camera_thread = threading.Thread(target=camera_loop, daemon=True)
     camera_thread.start()
-    rgb_camera = RGBCamera(camera_index=0)
+    rgb_camera = RGBCamera(camera_index=RGB_CAMERA_INDEX)
     rgb_camera.start()
     try:
         app.run(host="0.0.0.0", port=8050, debug=False)
