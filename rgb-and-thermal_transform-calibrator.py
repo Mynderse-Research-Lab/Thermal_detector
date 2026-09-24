@@ -1,8 +1,15 @@
 import cv2
 import numpy as np
+import json
+from pathlib import Path
+from datetime import datetime
 
 RGB_CAMERA_INDEX = 0
 THERMAL_CAMERA_INDEX = 1  #change if necessary
+JSON_FILE = (Path(__file__).resolve.parent / "dual-cam_transform-coord.json")
+
+rgb_calibration_points = []
+thermal_calibration_points = []
 
 rgb_crosshair = None
 thermal_crosshair = None
@@ -60,6 +67,7 @@ def rgb_mouse_callback(event, x, y, flags, parameter): #mouse interrupt routine 
 
     if event == cv2.EVENT_LBUTTONDOWN: #if a left click triggers an interrupt
         rgb_crosshair = (x, y) #record the pixel coordinate location x,y
+        rgb_calibration_points.append([float(x), float(y)])
         print(f"RGB point:     [{x}, {y}]") #print location
 
 
@@ -68,7 +76,55 @@ def thermal_mouse_callback(event, x, y, flags, parameter): #mouse interrupt rout
 
     if event == cv2.EVENT_LBUTTONDOWN: #if a left click triggers an interrupt
         thermal_crosshair = (x, y) #record the pixel coordinate location x,y
+        thermal_calibration_points.append([float(x),float(y)])
         print(f"Thermal point: [{x}, {y}]") #print location
+
+def save_calibration(rgb_frame_shape, thermal_frame_shape):
+    if len(rgb_calibration_points) < 4:
+        print("Calibration requires at least four RGB points")
+        return False
+    if len(thermal_calibration_points) < 4:
+        print("Calibration requires at least four Thermal points")
+        return False
+    if(len(rgb_calibration_points) != len(thermal_calibration_points)):
+        print("The number of RGB and thermal points must be equal.")
+        print(f"RGB points: {len(rgb_calibration_points)}")
+        print(f"Thermal points:{len(thermal_calibration_points)}")
+        return False
+    rgb_points_array = np.asarray(rgb_calibration_points, dtype=np.float32)
+    thermal_points_array = np.asarray(thermal_calibration_points, dtype=np.float32)
+    thermal_to_rgb_matrix, inlier_mask = (
+        cv2.findHomography(thermal_points_array, rgb_points_array, method=cv2.RANSAC, ransacReprojThreshold=3.0))
+    if thermal_to_rgb_matrix is None:
+        print("Could not calculate the homography")
+        return False
+    rgb_height, rgb_width = rgb_frame_shape[:2]
+    thermal_height, thermal_width = thermal_frame_shape[:2]
+    calibration_data = {
+        "version": 1,
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "coord_sys": {
+            "rgb":{
+                "width": int(rgb_width),
+                "height": int(rgb_height)},
+            "thermal":{
+                "width": int(thermal_width),
+                "height": int(thermal_height)}},
+        "rgb_points": (rgb_points_array.tolist()),
+        "thermal_points": (thermal_points_array.tolist()),
+        "thermal_to_rgb_matrix": (thermal_to_rgb_matrix.tolist()),
+        "ransac_inliers": (
+            inlier_mask.reshape(-1).astype(int).tolist()
+            if inlier_mask is not None
+            else None
+        )
+    }
+    temporary_file = JSON_FILE.with_suffix(".json.tmp")
+    temporary_file.write_text(json.dumps(calibration_data, indent=4), encoding="utf-8")
+    temporary_file.replace(JSON_FILE)
+    print(f"Saved calibration to: {JSON_FILE}")
+    print(f"thermal to rgb matrix: {thermal_to_rgb_matrix}")
+    return True
 
 
 rgb_camera = cv2.VideoCapture( #grab camera output from rgb
@@ -187,9 +243,17 @@ while True:
     )
 
     key = cv2.waitKey(1) & 0xFF
+    if key == ord("s"): save_calibration(rgb_frame.shape, thermal_frame.shape)
 
-    if key == ord("q"):
-        break
+    if key == ord("q"): break
+
+    if key == ord("u"):
+        if rgb_calibration_points:
+            removed_rgb = (rgb_calibration_points.pop())
+            print(f"Removed point: {removed_rgb}")
+        if thermal_calibration_points:
+            removed_thermal=(thermal_calibration_points.pop())
+            print(f"Removed thermal point: {removed_thermal}")
 
     # Press C to clear both crosshairs.
     if key == ord("c"):
