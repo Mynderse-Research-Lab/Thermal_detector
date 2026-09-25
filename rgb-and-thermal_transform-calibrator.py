@@ -1,12 +1,13 @@
 import cv2
 import numpy as np
 import json
+import sys
 from pathlib import Path
 from datetime import datetime
 
 RGB_CAMERA_INDEX = 0
-THERMAL_CAMERA_INDEX = 1  #change if necessary
-JSON_FILE = (Path(__file__).resolve.parent / "dual-cam_transform-coord.json")
+THERMAL_CAMERA_INDEX = 2  #change if necessary
+JSON_FILE = (Path(__file__).resolve().parent / "dual-cam_transform-coord.json")
 
 rgb_calibration_points = []
 thermal_calibration_points = []
@@ -61,6 +62,15 @@ def draw_crosshair(frame, point, label):
 
     return output
 
+def draw_calibration_points(frame, points, color=(0,255,0)):
+    output = frame.copy()
+    for point_num, point in enumerate(points, start=1):
+        x = int(round(point[0]))
+        y = int(round(point[1]))
+
+        cv2.circle(output, (x,y), 5, color, -1, cv2.LINE_AA)
+        cv2.putText(output, str(point_num), (x+8, max(y-8, 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+    return output
 
 def rgb_mouse_callback(event, x, y, flags, parameter): #mouse interrupt routine on rgb image
     global rgb_crosshair
@@ -68,7 +78,7 @@ def rgb_mouse_callback(event, x, y, flags, parameter): #mouse interrupt routine 
     if event == cv2.EVENT_LBUTTONDOWN: #if a left click triggers an interrupt
         rgb_crosshair = (x, y) #record the pixel coordinate location x,y
         rgb_calibration_points.append([float(x), float(y)])
-        print(f"RGB point:     [{x}, {y}]") #print location
+        print(f"RGB point: {len(rgb_calibration_points)}: [{x}, {y}]") #print location
 
 
 def thermal_mouse_callback(event, x, y, flags, parameter): #mouse interrupt routine on thermal image
@@ -98,6 +108,7 @@ def save_calibration(rgb_frame_shape, thermal_frame_shape):
     if thermal_to_rgb_matrix is None:
         print("Could not calculate the homography")
         return False
+    
     rgb_height, rgb_width = rgb_frame_shape[:2]
     thermal_height, thermal_width = thermal_frame_shape[:2]
     calibration_data = {
@@ -157,8 +168,8 @@ if not rgb_camera.isOpened():
 if not thermal_camera.isOpened():
     raise RuntimeError("Could not open thermal camera")
 
-cv2.namedWindow("RGB Calibration", cv2.WINDOW_NORMAL)
-cv2.namedWindow("Thermal Calibration", cv2.WINDOW_NORMAL)
+cv2.namedWindow("RGB Calibration", cv2.WINDOW_AUTOSIZE)
+cv2.namedWindow("Thermal Calibration", cv2.WINDOW_AUTOSIZE)
 
 cv2.setMouseCallback(
     "RGB Calibration",
@@ -209,56 +220,43 @@ while True:
         display_max
     )
 
-    normalized = (
-        (clipped - display_min)
-        / (display_max - display_min)
-        * 255
-    ).astype(np.uint8)
+    normalized = ((clipped - display_min) / (display_max - display_min) * 255).astype(np.uint8)
 
-    thermal_frame = cv2.applyColorMap(
-        normalized,
-        cv2.COLORMAP_JET
-    )
+    thermal_frame = cv2.applyColorMap(normalized, cv2.COLORMAP_JET)
 
-    rgb_display = draw_crosshair(
-        rgb_frame,
-        rgb_crosshair,
-        "RGB"
-    )
+    rgb_display = draw_calibration_points(rgb_frame, rgb_calibration_points)
 
-    thermal_display = draw_crosshair(
-        thermal_frame,
-        thermal_crosshair,
-        "Thermal"
-    )
+    thermal_display = draw_calibration_points(thermal_frame, thermal_calibration_points)
 
-    cv2.imshow(
-        "RGB Calibration",
-        rgb_display
-    )
+    rgb_display = draw_crosshair(rgb_frame, rgb_crosshair, "RGB")
 
-    cv2.imshow(
-        "Thermal Calibration",
-        thermal_display
-    )
+    thermal_display = draw_crosshair(thermal_frame, thermal_crosshair,"Thermal")
+
+    cv2.imshow("RGB Calibration", rgb_display)
+
+    cv2.imshow("Thermal Calibration", thermal_display)
 
     key = cv2.waitKey(1) & 0xFF
-    if key == ord("s"): save_calibration(rgb_frame.shape, thermal_frame.shape)
-
-    if key == ord("q"): break
-
-    if key == ord("u"):
+    if key == ord("s"): 
+        save_calibration(rgb_frame.shape, thermal_frame.shape)
+        print("calibration points saved")
+    elif key == ord("q"): sys.exit()
+    elif key == ord("u"):
         if rgb_calibration_points:
             removed_rgb = (rgb_calibration_points.pop())
             print(f"Removed point: {removed_rgb}")
         if thermal_calibration_points:
             removed_thermal=(thermal_calibration_points.pop())
             print(f"Removed thermal point: {removed_thermal}")
-
-    # Press C to clear both crosshairs.
-    if key == ord("c"):
         rgb_crosshair = None
         thermal_crosshair = None
+    elif key == ord("c"):
+        rgb_crosshair = None
+        thermal_crosshair = None
+        rgb_calibration_points.clear()
+        thermal_calibration_points.clear()
+        print("Cleared all calibration points")
+
 
 rgb_camera.release()
 thermal_camera.release()

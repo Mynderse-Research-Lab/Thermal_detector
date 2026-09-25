@@ -23,8 +23,74 @@ MAX_RISE_C_PER_S = 2.0
 MAX_TEMP_THRESHOLD = 100
 THERMAL_CAMERA_INDEX=2
 RGB_CAMERA_INDEX=0
+CALIBRATION_FILE = (Path(__file__).resolve().parent / "dual-cam_transform-coord.json")
 
-rgb_points = np.float32([
+def load_calibration():
+    if not CALIBRATION_FILE.exists():
+        raise FileNotFoundError("Camera calibration file not found: {CALIBRATION_FILE}")
+    try: 
+        with CALIBRATION_FILE.open("r", encoding="utf-8") as calibration_file:
+            calibration_data = json.load(calibration_file)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("The calibration JSON file is invalid: {error}") from error
+    required_fields = [
+        "thermal_to_rgb_matrix",
+        "rgb_points",
+        "thermal_points",
+        "coord_sys"
+    ]
+
+    missing_fields = [field for field in required_fields if field not in calibration_data]
+
+    if missing_fields:
+        raise KeyError("Calibration JSON is missing: " + ",".join(missing_fields))
+    thermal_to_rgb_matrix = np.asarray(calibration_data["thermal_to_rgb_matrix"], dtype=np.float64)
+    if thermal_to_rgb_matrix.shape != (3,3):
+        raise ValueError(
+            f"thermal_to_rgb_matrix must be 3x3; recieved {thermal_to_rgb_matrix.shape}")
+    if not np.all(np.isfinite(thermal_to_rgb_matrix)):
+        raise ValueError("The thermal-to-RGB matrix contains NaN or infinite values")
+
+    rgb_points = np.asarray(calibration_data["rgb_points"], dtype=np.float32)
+    thermal_points = np.asarray(calibration_data["thermal_points"], dtype=np.float32)
+    if rgb_points.ndim != 2 or rgb_points.shape[1] != 2:
+        raise ValueError("rgb_points must have shape Nx2")
+    if (thermal_points.ndim != 2 or thermal_points.shape[1] != 2):
+        raise ValueError("thermal_points must have shape Nx2")
+    if len(rgb_points) != len(thermal_points):
+        raise ValueError("RGB and thermal calibration point counts do not match")
+    print(f"loaded camera calibration from: {CALIBRATION_FILE}")
+    print(f"Calibration created: {calibration_data.get('created', 'unknown')}")
+    print(f"Calibration points: {len(rgb_points)}")
+    print("Thermal-to-rgb transformation matrix: ")
+    print(thermal_to_rgb_matrix)
+    return(thermal_to_rgb_matrix, calibration_data)
+
+thermal_to_rgb_matrix,calibration_data = (load_calibration())
+
+def validate_calibration_resolution(frame, camera_name):
+    coordinate_systems = (calibration_data.get("coord_sys", {}))
+    saved_resolution = coordinate_systems.get(camera_name)
+
+    if saved_resolution is None:
+        print(f"WARNING: No saved resolution for {camera_name}.")
+        return True
+
+    actual_height, actual_width = frame.shape[:2]
+
+    expected_width = int(saved_resolution["width"])
+
+    expected_height = int(saved_resolution["height"])
+
+    matches = (actual_width == expected_width and actual_height == expected_height)
+
+    if not matches:
+        print(f"WARNING: {camera_name.upper()} resolution is {actual_width}x{actual_height}; "
+            f"calibration used {expected_width}x{expected_height}.")
+
+    return matches
+
+'''rgb_points = np.float32([
     [465, 102],
     [863, 85],
     [467, 153],
@@ -36,15 +102,16 @@ thermal_points = np.float32([
     [141, 58],
     [70, 70],
     [141, 68]
-])
+])'''
 
 
-
+'''
 thermal_to_rgb_matrix, calibration_mask = cv2.findHomography(
     thermal_points, rgb_points, method=cv2.RANSAC, ransacReprojThreshold=3.0)
 
 if thermal_to_rgb_matrix is None:
     raise RuntimeError("Could not calculate thermal-to-RGB homography")
+'''
 
 projected_hotspot_lock = threading.Lock()
 #latest_projected_rgb_roi = None
@@ -136,8 +203,7 @@ def frame_to_temp_array(frame):
     return temp_img
 
 
-
-rgb_to_thermal, inlier_mask = cv2.findHomography(rgb_points, thermal_points, method=cv2.RANSAC, ransacReprojThreshold=3.0)
+'''rgb_to_thermal, inlier_mask = cv2.findHomography(rgb_points, thermal_points, method=cv2.RANSAC, ransacReprojThreshold=3.0)
 if rgb_to_thermal is None:
     raise RuntimeError("Could not calculate RGB to Thermal transformation")
 
@@ -145,7 +211,7 @@ def map_rgb_to_thermal(rgb_points):
     points = np.asarray(rgb_points, dtype=np.float32).reshape(-1,1,2)
     thermal_points = cv2.perspectiveTransform(points, rgb_to_thermal)
     return thermal_points.reshape(-1,2)
-
+'''
 scale=3
 def draw_thermal_detection(heatmap, thermal_polygon, label="Detected module"):
     display_polygon = np.round(thermal_polygon * scale).astype(np.int32)
@@ -346,6 +412,7 @@ def camera_loop():
     global latest_frame, latest_stats
     #global latest_projected_rgb_roi
     global latest_projected_rgb_hotspot
+    thermal_resolution_checked = False
 
     camera = cv2.VideoCapture(THERMAL_CAMERA_INDEX, cv2.CAP_V4L2)
     camera.set(cv2.CAP_PROP_CONVERT_RGB, 0)
@@ -397,7 +464,9 @@ def camera_loop():
 
             # Full temp image (°C) per pixel
             temp_img = (raw_img.astype(np.float32) / 64.0) - 273.15
-
+            if not thermal_resolution_checked: 
+                validate_calibration_resolution(temp_img, "thermal")
+                thermal_resolution_checked = True
             # Max temp + location
             max_idx = np.unravel_index(raw_img.argmax(), raw_img.shape)
             mrow, mcol = int(max_idx[0]), int(max_idx[1])  # row, col
@@ -695,6 +764,7 @@ class RGBCamera:
         self.lock = threading.Lock()
         self.running = False
         self.thread = None
+        self.resolution_checked = False
 
     def start(self):
         if self.running:
@@ -716,6 +786,9 @@ class RGBCamera:
         while self.running:
             success, frame = self.capture.read()
             if success:
+                if not self.resolution_checked:
+                    validate_calibration_resolution(frame, "rgb")
+                    self.resolution_checked = True
                 with self.lock:
                     self.latest_frame = frame.copy()
             else:
