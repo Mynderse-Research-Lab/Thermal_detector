@@ -169,7 +169,7 @@ if not thermal_camera.isOpened():
     raise RuntimeError("Could not open thermal camera")
 
 cv2.namedWindow("RGB Calibration", cv2.WINDOW_AUTOSIZE)
-cv2.namedWindow("Thermal Calibration", cv2.WINDOW_AUTOSIZE)
+cv2.namedWindow("Thermal Calibration", cv2.WINDOW_FREERATIO)
 
 cv2.setMouseCallback(
     "RGB Calibration",

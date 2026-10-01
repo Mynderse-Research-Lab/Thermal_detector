@@ -23,16 +23,19 @@ MAX_RISE_C_PER_S = 2.0
 MAX_TEMP_THRESHOLD = 100
 THERMAL_CAMERA_INDEX=2
 RGB_CAMERA_INDEX=0
+THERMAL_OVERLAY_ALPHA = 0.45
+STATUS_INTERVAL = 0.5
+last_status_time = 0.0
 CALIBRATION_FILE = (Path(__file__).resolve().parent / "dual-cam_transform-coord.json")
 
 def load_calibration():
     if not CALIBRATION_FILE.exists():
-        raise FileNotFoundError("Camera calibration file not found: {CALIBRATION_FILE}")
+        raise FileNotFoundError(f"Camera calibration file not found: {CALIBRATION_FILE}")
     try: 
         with CALIBRATION_FILE.open("r", encoding="utf-8") as calibration_file:
             calibration_data = json.load(calibration_file)
     except json.JSONDecodeError as error:
-        raise RuntimeError("The calibration JSON file is invalid: {error}") from error
+        raise RuntimeError(f"The calibration JSON file is invalid: {error}") from error
     required_fields = [
         "thermal_to_rgb_matrix",
         "rgb_points",
@@ -43,22 +46,22 @@ def load_calibration():
     missing_fields = [field for field in required_fields if field not in calibration_data]
 
     if missing_fields:
-        raise KeyError("Calibration JSON is missing: " + ",".join(missing_fields))
+        raise KeyError(f"Calibration JSON is missing: " + ",".join(missing_fields))
     thermal_to_rgb_matrix = np.asarray(calibration_data["thermal_to_rgb_matrix"], dtype=np.float64)
     if thermal_to_rgb_matrix.shape != (3,3):
         raise ValueError(
             f"thermal_to_rgb_matrix must be 3x3; recieved {thermal_to_rgb_matrix.shape}")
     if not np.all(np.isfinite(thermal_to_rgb_matrix)):
-        raise ValueError("The thermal-to-RGB matrix contains NaN or infinite values")
+        raise ValueError(f"The thermal-to-RGB matrix contains NaN or infinite values")
 
     rgb_points = np.asarray(calibration_data["rgb_points"], dtype=np.float32)
     thermal_points = np.asarray(calibration_data["thermal_points"], dtype=np.float32)
     if rgb_points.ndim != 2 or rgb_points.shape[1] != 2:
-        raise ValueError("rgb_points must have shape Nx2")
+        raise ValueError(f"rgb_points must have shape Nx2")
     if (thermal_points.ndim != 2 or thermal_points.shape[1] != 2):
-        raise ValueError("thermal_points must have shape Nx2")
+        raise ValueError(f"thermal_points must have shape Nx2")
     if len(rgb_points) != len(thermal_points):
-        raise ValueError("RGB and thermal calibration point counts do not match")
+        raise ValueError(f"RGB and thermal calibration point counts do not match")
     print(f"loaded camera calibration from: {CALIBRATION_FILE}")
     print(f"Calibration created: {calibration_data.get('created', 'unknown')}")
     print(f"Calibration points: {len(rgb_points)}")
@@ -67,7 +70,20 @@ def load_calibration():
     return(thermal_to_rgb_matrix, calibration_data)
 
 thermal_to_rgb_matrix,calibration_data = (load_calibration())
+if thermal_to_rgb_matrix is None:
+    raise RuntimeError(f"The thermal-to-rgb calibration could not be loaded")
 
+def overlay_thermal_on_rgb(rgb_frame, thermal_frame, thermal_to_rgb_matrix, alpha = THERMAL_OVERLAY_ALPHA):
+    rgb_height, rgb_width = rgb_frame.shape[:2]
+    warped_thermal = cv2.warpPerspective(thermal_frame, thermal_to_rgb_matrix, (rgb_width, rgb_height), flags=cv2.INTER_LINEAR)
+    thermal_mask = np.full(thermal_frame.shape[:2], 255, dtype=np.uint8)
+    warped_mask = cv2.warpPerspective(thermal_mask, thermal_to_rgb_matrix, (rgb_width, rgb_height), flags=cv2.INTER_NEAREST)
+    valid_pixels = warped_mask > 0
+    combined_frame = rgb_frame.copy()
+    blended = cv2.addWeighted(rgb_frame, 1.0-alpha, warped_thermal, alpha, 0)
+    combined_frame[valid_pixels] = blended[valid_pixels]
+    return combined_frame, warped_thermal
+    
 def validate_calibration_resolution(frame, camera_name):
     coordinate_systems = (calibration_data.get("coord_sys", {}))
     saved_resolution = coordinate_systems.get(camera_name)
@@ -131,6 +147,7 @@ data_folder_path.mkdir(exist_ok=True)
 
 frame_lock = threading.Lock()
 latest_frame = None
+latest_combined_frame = None
 latest_stats = {
     "max_temp": 0.0,
     "avg_temp": 0.0,
@@ -409,12 +426,13 @@ def log_data(timestamp, maxTemp, avgTemp,centerTemp, roiMax, roiAvg, riseRate, m
         writer.writerow([timestamp, maxTemp, avgTemp, centerTemp, roiMax, roiAvg, riseRate, maxTempFlag, runawayFlag]) #write a new row to the CSV file
 
 def camera_loop():
-    global latest_frame, latest_stats
+    global latest_frame, latest_stats, latest_combined_frame
     #global latest_projected_rgb_roi
     global latest_projected_rgb_hotspot
     thermal_resolution_checked = False
 
     camera = cv2.VideoCapture(THERMAL_CAMERA_INDEX, cv2.CAP_V4L2)
+    camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     camera.set(cv2.CAP_PROP_CONVERT_RGB, 0)
     camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('Y', 'U', 'Y','V'))
     camera.set(cv2.CAP_PROP_FRAME_WIDTH, 256)
@@ -438,9 +456,11 @@ def camera_loop():
     while camera.isOpened():
         try:
             ret, frame = camera.read()
-            print("Frame shape:", frame.shape, "dtype:", frame.dtype)
+            #print("Frame shape:", frame.shape, "dtype:", frame.dtype)
 
-            if not ret:
+            if not ret or frame is None:
+                print("WARNING: Failed to read thermal camera frame")
+                time.sleep(0.01)
                 continue
 
             # Split combined frame into visible + thermal parts
@@ -548,17 +568,23 @@ def camera_loop():
             ).astype(np.uint8)
 
             # Apply JET to the actual temperature data.
-            heatmap = cv2.applyColorMap(
+            heatmap_og = cv2.applyColorMap(
                 normalized_temp,
                 cv2.COLORMAP_JET
             )
 
+            rgb_frame = rgb_camera.get_frame()
+            if rgb_frame is not None:
+                combined_display, warped_thermal = overlay_thermal_on_rgb(rgb_frame, heatmap_og, thermal_to_rgb_matrix, alpha=THERMAL_OVERLAY_ALPHA)
+            else: combined_display=None
+
             heatmap = cv2.resize(
-                heatmap,
+                heatmap_og,
                 (newWidth, newHeight),
                 interpolation=cv2.INTER_CUBIC
             )
-
+            #combined_display, warped_thermal = overlay_thermal_on_rgb(rgb_camera, heatmap, thermal_to_rgb_matrix, alpha=THERMAL_OVERLAY_ALPHA)
+            
             #thermal_polygon = map_rgb_to_thermal(rgb_detection_polygon)
             #draw_thermal_detection(heatmap, thermal_polygon, label="RGB Detection")
 
@@ -611,6 +637,18 @@ def camera_loop():
             projected_rgb_hotspot = map_thermal_points_to_rgb([[mcol, mrow]])[0]
             projected_rgb_hotspot[0] += RGB_X_OFFSET
             projected_rgb_hotspot[1] += RGB_Y_OFFSET
+            if combined_display is not None:
+                hot_x = int(round(projected_rgb_hotspot[0]))
+                hot_y = int(round(projected_rgb_hotspot[1]))
+                combined_height, combined_width = combined_display.shape[:2]
+                if(0 <= hot_x < combined_width and 0 <= hot_y < combined_height):
+                    rgb_x1 = max(0, hot_x - RGB_ROI_HALF_WIDTH)
+                    rgb_y1 = max(0, hot_y - RGB_ROI_HALF_HEIGHT)
+                    rgb_x2 = min(combined_width - 1, hot_x + RGB_ROI_HALF_WIDTH)
+                    rgb_y2 = min(combined_height - 1, hot_y +RGB_ROI_HALF_HEIGHT)
+                    cv2.rectangle(combined_display, (rgb_x1, rgb_y1), (rgb_x2, rgb_y2), (255,255,255), 3)
+                    cv2.drawMarker(combined_display, (hot_x, hot_y), color=(255,255,255), markerType=cv2.MARKER_CROSS, markerSize=30, thickness=3, line_type=cv2.LINE_AA)
+                    cv2.putText(combined_display, f"Hotspot: {hot_x}, {hot_y})", (rgb_x1, max(rgb_y1-12, 25)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
             with projected_hotspot_lock:
                 #latest_projected_rgb_roi=projected_rgb_roi.copy()
                 latest_projected_rgb_hotspot = (projected_rgb_hotspot.copy())
@@ -698,11 +736,13 @@ def camera_loop():
 
             with frame_lock:
                 latest_frame = heatmap
+                if combined_display is not None:
+                    latest_combined_frame = combined_display.copy()
                 latest_stats = dashboard_stats
 
             log_data(sample_timestamp.isoformat(timespec="milliseconds"), dashboard_stats["max_temp"], dashboard_stats["avg_temp"], dashboard_stats["center_temp"], dashboard_stats["roi_max"], dashboard_stats["roi_avg"], dashboard_stats["rise_rate"], dashboard_stats["max_temp_warning"], dashboard_stats["thermal_runaway_warning"])
 
-            time.sleep(0.05)
+            time.sleep(0.005)
         except Exception as e:
             print("ERROR in camera_loop:", e)
             time.sleep(1)
@@ -723,13 +763,16 @@ def generate_video_stream():
     while True:
         with frame_lock:
             if latest_frame is None:
-                continue
+                frame=None
+            else:
+                frame = latest_frame.copy()
+        if frame is None:
+            time.sleep(0.05)
+            continue
+        success, buffer = cv2.imencode(".jpg", frame)
 
-            frame = latest_frame.copy()
-
-        ret, buffer = cv2.imencode(".jpg", frame)
-
-        if not ret:
+        if not success:
+            time.sleep(0.05)
             continue
 
         frame_bytes = buffer.tobytes()
@@ -738,6 +781,28 @@ def generate_video_stream():
             b"--frame\r\n"
             b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
         )
+        time.sleep(0.04)
+
+def generate_combined_stream():
+    while True:
+        with frame_lock:
+            if latest_combined_frame is None:
+                frame = None
+            else:
+                frame=latest_combined_frame.copy()
+        if frame is None:
+            time.sleep(0.05)
+            continue
+        success, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        if not success:
+            time.sleep(0.05)
+            continue
+        frame_bytes = buffer.tobytes()
+        yield(
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
+        )
+        time.sleep(0.04)
 
 server = Flask(__name__)
 app = Dash(__name__, server=server)
@@ -753,6 +818,13 @@ def video_feed():
 def rgb_video_feed():
     return Response(
         generate_rgb_stream(),
+        mimetype="multipart/x-mixed-replace; boundary=frame"
+    )
+
+@server.route("/combined-video-feed")
+def combined_video_feed():
+    return Response(
+        generate_combined_stream(),
         mimetype="multipart/x-mixed-replace; boundary=frame"
     )
 
@@ -773,6 +845,7 @@ class RGBCamera:
         self.capture = cv2.VideoCapture(self.camera_index, cv2.CAP_V4L2)
         if not self.capture.isOpened():
             raise RuntimeError(f"Could not open RGB Camera {self.camera_index}")
+        self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         self.capture.set(cv2.CAP_PROP_FPS, 30)
@@ -794,6 +867,12 @@ class RGBCamera:
             else:
                 print("Unable to read RGB Camera frame")
                 time.sleep(0.1)
+    def get_frame(self):
+        with self.lock:
+            if self.latest_frame is None: 
+                return None
+
+            return self.latest_frame.copy()
     def get_jpeg(self):
         with self.lock:
             if self.latest_frame is None:
@@ -966,7 +1045,22 @@ app.layout = html.Div([
                       "gap": "20px",
                       "width": "100%",
                       "flexWrap": "nowrap"
-                  }),  
+                  }),
+    html.Div([
+        html.H3("Thermal Overlay on RGB", style={"textAlign":"center"}),
+        html.Img(
+            src="/combined-video-feed",
+            style={
+                "width": "100%",
+                "maxWidth": "1280px",
+                "height": "auto",
+                "maxHeight": "80vh",
+                "objectFit": "contain",
+                "display" : "block",
+                "margin": "0 auto",
+                "border": "2px solid #333",
+                "borderRadius" : "6px"
+            })]),
     html.Div(id="runaway_notification", style={"display":"none"}),
     html.Div([dcc.Button('Reset', id='reset-alarm-button', n_clicks = 0),
                   html.Span(id="reset-status", style={"marginLeft": "12px"}),],
@@ -1148,10 +1242,10 @@ def update_center_temperature_graph(n_intervals):
 if __name__ == '__main__':
     initialize_csv()
     
-    camera_thread = threading.Thread(target=camera_loop, daemon=True)
-    camera_thread.start()
     rgb_camera = RGBCamera(camera_index=RGB_CAMERA_INDEX)
     rgb_camera.start()
+    camera_thread = threading.Thread(target=camera_loop, daemon=True)
+    camera_thread.start()
     try:
         app.run(host="0.0.0.0", port=8050, debug=False)
     finally:

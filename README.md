@@ -1,12 +1,12 @@
 # Thermal Detector (OpenCV)
 
-A lightweight thermal visualization + safety monitoring script that reads a **combined visible + thermal** frame from a V4L2 camera device (e.g., a thermal module that outputs YUYV + 16-bit thermal data in a single stream). The script:
+A thermal visualization + safety monitoring script that reads a **combined visible + thermal** frame from a V4L2 camera device (e.g., a thermal module that outputs YUYV + 16-bit thermal data in a single stream) alongside an RGB webcam output for visual feature detection. The script:
 
-- Displays a scaled **heatmap** window with crosshairs and an optional HUD
+- Publishes a network-attached dashboard which displays a scaled **heatmap** window with crosshairs and HUD
 - Computes **center pixel**, **average**, **min**, **max** temperatures
 - Tracks **thermal runaway risk** using max-temp rise rate (°C/s)
 - Draws a configurable **ROI** box and reports ROI max/mean temperature
-- Logs periodic temperature data to `thermal_data.csv`
+- Is capable of logging periodic temperature data to `thermal_data.csv`
 
 ---
 
@@ -51,6 +51,9 @@ source venv/bin/activate
 - Python 3
 - OpenCV (`cv2`)
 - NumPy
+- Plotly Dash
+- JSON
+- Flask
 
 Install example:
 ```bash
