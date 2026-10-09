@@ -1,5 +1,5 @@
 #dashboard for thermal camera monitoring
-from dash import Dash, dcc, html
+from dash import Dash, dcc, html, ctx
 from dash.dependencies import Input, Output, State
 from collections import deque
 import plotly.graph_objs as go
@@ -24,9 +24,19 @@ MAX_TEMP_THRESHOLD = 100
 THERMAL_CAMERA_INDEX=2
 RGB_CAMERA_INDEX=0
 THERMAL_OVERLAY_ALPHA = 0.45
+OVERLAY_MOVE_STEP = 5
+overlay_x_offset=0
+overlay_y_offset=0
+overlay_alignment_lock=threading.Lock()
 STATUS_INTERVAL = 0.5
 last_status_time = 0.0
 CALIBRATION_FILE = (Path(__file__).resolve().parent / "dual-cam_transform-coord.json")
+
+def clear_overlay_mask_cache():
+    global cached_overlay_mask
+    global cached_overlay_mask_size
+    cached_overlay_mask = None
+    cached_overlay_mask_size = None
 
 def load_calibration():
     if not CALIBRATION_FILE.exists():
@@ -72,6 +82,15 @@ def load_calibration():
 thermal_to_rgb_matrix,calibration_data = (load_calibration())
 if thermal_to_rgb_matrix is None:
     raise RuntimeError(f"The thermal-to-rgb calibration could not be loaded")
+base_thermal_to_rgb_matrix = thermal_to_rgb_matrix.copy()
+
+def get_adjusted_thermal_to_rgb_matrix():
+    with overlay_alignment_lock:
+        x_offset = float(overlay_x_offset)
+        y_offset = float(overlay_y_offset)
+    translation_matrix = np.array([[1.0, 0.0, x_offset],[0.0,1.0,y_offset],[0.0,0.0,1.0]], dtype=np.float64)
+    adjusted_matrix = (translation_matrix @ base_thermal_to_rgb_matrix) #@ => matrix multiplication
+    return adjusted_matrix
 
 def overlay_thermal_on_rgb(rgb_frame, thermal_frame, thermal_to_rgb_matrix, alpha = THERMAL_OVERLAY_ALPHA):
     rgb_height, rgb_width = rgb_frame.shape[:2]
@@ -189,9 +208,11 @@ threshold = 2
 
 TEST_ROI = (100, 100, 200, 150)
 
-def map_thermal_points_to_rgb(thermal_points):
+def map_thermal_points_to_rgb(thermal_points, transform_matrix=None):
+    if transform_matrix is None:
+        transform_matrix = (get_adjusted_thermal_to_rgb_matrix())
     points = np.asarray(thermal_points, dtype=np.float32).reshape(-1,1,2)
-    rgb_points = cv2.perspectiveTransform(points, thermal_to_rgb_matrix)
+    rgb_points = cv2.perspectiveTransform(points, transform_matrix)
     return rgb_points.reshape(-1,2)
 
 def detect_pack_region(img):
@@ -572,10 +593,10 @@ def camera_loop():
                 normalized_temp,
                 cv2.COLORMAP_JET
             )
-
+            current_transform = (get_adjusted_thermal_to_rgb_matrix())
             rgb_frame = rgb_camera.get_frame()
             if rgb_frame is not None:
-                combined_display, warped_thermal = overlay_thermal_on_rgb(rgb_frame, heatmap_og, thermal_to_rgb_matrix, alpha=THERMAL_OVERLAY_ALPHA)
+                combined_display, warped_thermal = overlay_thermal_on_rgb(rgb_frame, heatmap_og, current_transform, alpha=THERMAL_OVERLAY_ALPHA)
             else: combined_display=None
 
             heatmap = cv2.resize(
@@ -634,7 +655,7 @@ def camera_loop():
                 #[x1,y2]
             #])
             #projected_rgb_roi = map_thermal_points_to_rgb(thermal_roi_polygon)
-            projected_rgb_hotspot = map_thermal_points_to_rgb([[mcol, mrow]])[0]
+            projected_rgb_hotspot = map_thermal_points_to_rgb([[mcol, mrow]], current_transform)[0]
             projected_rgb_hotspot[0] += RGB_X_OFFSET
             projected_rgb_hotspot[1] += RGB_Y_OFFSET
             if combined_display is not None:
@@ -1061,6 +1082,32 @@ app.layout = html.Div([
                 "border": "2px solid #333",
                 "borderRadius" : "6px"
             })]),
+    html.Div([
+        html.H4("Manual Thermal Overlay Alignment", style={"textAlign":"center"}),
+        html.Div([html.Button("↑", id="overlay-move-up", n_clicks = 0, style={"fontSize":"24px", "width":"60px", "height":"45px"})],
+                 style={
+                     "display":"flex",
+                     "justifyContent":"center",
+                     "marginBottom":"5px"
+                 }),
+        html.Div([html.Button("←", id="overlay-move-left", n_clicks = 0, style={"fontSize":"24px", "width":"60px", "height":"45px"}),
+                html.Button("Reset", id="overlay-reset-position", n_clicks=0, style={"fontSize":"16px","width":"80px","height":"45px"}),
+                html.Button("→", id="overlay-move-right", n_clicks = 0, style={"fontSize":"24px","width":"60px","height":"45px"})],
+                style={
+                    "display":"flex",
+                    "justifyContent":"center",
+                    "marginBottom":"5px"
+                }),
+    html.Div([html.Button("↓", id="overlay-move-down", n_clicks=0, style={"fontSize":"24px","width":"60px","height":"45px"})],
+              style={
+                  "display":"flex",
+                  "justifyContent":"center"
+              }),
+    html.Div(id="overlay-alignment-status", children="Overlay offset: x= 0 px, y= 0 px", style={"textAlign":"center", "marginTop":"10px", "fontWeight":"bold"})],
+            style={
+                "marginTop":"15px",
+                "marginBottom":"25px"
+            }),
     html.Div(id="runaway_notification", style={"display":"none"}),
     html.Div([dcc.Button('Reset', id='reset-alarm-button', n_clicks = 0),
                   html.Span(id="reset-status", style={"marginLeft": "12px"}),],
@@ -1238,6 +1285,38 @@ def update_center_temperature_graph(n_intervals):
     )
 
     return figure
+
+@app.callback(
+    Output("overlay-alignment-status","children"),
+    Input("overlay-move-up","n_clicks"),
+    Input("overlay-move-down","n_clicks"),
+    Input("overlay-move-left","n_clicks"),
+    Input("overlay-move-right","n_clicks"),
+    Input("overlay-reset-position","n_clicks"),
+    prevent_initial_call=True
+)
+
+def update_overlay_alignment(up_clicks, down_clicks, left_clicks, right_clicks, reset_clicks):
+    global overlay_x_offset
+    global overlay_y_offset
+    clicked_button = ctx.triggered_id
+    with overlay_alignment_lock:
+        if clicked_button == "overlay-move-up":
+            overlay_y_offset -= OVERLAY_MOVE_STEP
+        elif clicked_button == "overlay-move-down":
+            overlay_y_offset += OVERLAY_MOVE_STEP
+        elif clicked_button == "overlay-move-left":
+            overlay_x_offset -= OVERLAY_MOVE_STEP
+        elif clicked_button == "overlay-move-right":
+            overlay_x_offset += OVERLAY_MOVE_STEP
+        elif clicked_button == "overlay-reset-position":
+            overlay_x_offset=0
+            overlay_y_offset=0
+        current_x = overlay_x_offset
+        current_y = overlay_y_offset
+    clear_overlay_mask_cache()
+    return(f"Overlay offset: x = {current_x} px, y = {current_y} px")
+
 
 if __name__ == '__main__':
     initialize_csv()
