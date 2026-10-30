@@ -17,6 +17,7 @@ import io
 import sys
 import math
 from pathlib import Path
+#from pycomm3 import LogixDriver
 #this code is intended to recieve live camera input from a thermal camera and, based on the pack input from the user
 #and partition and monitor the battery pack temperature
 MAX_RISE_C_PER_S = 2.0
