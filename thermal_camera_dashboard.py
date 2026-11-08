@@ -17,7 +17,8 @@ import io
 import sys
 import math
 from pathlib import Path
-#from pycomm3 import LogixDriver
+from pycomm3 import LogixDriver
+
 #this code is intended to recieve live camera input from a thermal camera and, based on the pack input from the user
 #and partition and monitor the battery pack temperature
 MAX_RISE_C_PER_S = 2.0
@@ -32,6 +33,20 @@ overlay_alignment_lock=threading.Lock()
 STATUS_INTERVAL = 0.5
 last_status_time = 0.0
 CALIBRATION_FILE = (Path(__file__).resolve().parent / "dual-cam_transform-coord.json")
+
+use_RGB_flag = True #set to FALSE for thermal camera only output
+
+use_plc_flag = False #SET THIS FLAG TO USE PLC ###################################################
+PLC_ADDRESS = "10.10.1.10"
+TAG = 'UN01R15_uRobot_1_IO.IN.DO73_ClrOfFix1'
+PLC_CHECK_INTERVAL = 0.2
+PLC_RECONNECT_INTERVAL = 1.0
+robot_clear_event = threading.Event()
+if(use_plc_flag): #if we are using the PLC
+    robot_clear_event.clear() #block processing until recieve go signal from PLC
+else: #if we are NOT using PLC
+    robot_clear_event.set() #unblock processing completely
+
 
 def clear_overlay_mask_cache():
     global cached_overlay_mask
@@ -80,12 +95,16 @@ def load_calibration():
     print(thermal_to_rgb_matrix)
     return(thermal_to_rgb_matrix, calibration_data)
 
-thermal_to_rgb_matrix,calibration_data = (load_calibration())
-if thermal_to_rgb_matrix is None:
-    raise RuntimeError(f"The thermal-to-rgb calibration could not be loaded")
-base_thermal_to_rgb_matrix = thermal_to_rgb_matrix.copy()
+if (use_RGB_flag):
+    thermal_to_rgb_matrix,calibration_data = (load_calibration())
+    if thermal_to_rgb_matrix is None:
+        raise RuntimeError(f"The thermal-to-rgb calibration could not be loaded")
+    base_thermal_to_rgb_matrix = thermal_to_rgb_matrix.copy()
+else:
+    print("RGB Camera Disabled. Running in thermal-only mode")
 
 def get_adjusted_thermal_to_rgb_matrix():
+    if not use_RGB_flag: return None
     with overlay_alignment_lock:
         x_offset = float(overlay_x_offset)
         y_offset = float(overlay_y_offset)
@@ -168,6 +187,7 @@ data_folder_path.mkdir(exist_ok=True)
 frame_lock = threading.Lock()
 latest_frame = None
 latest_combined_frame = None
+rgb_camera=None
 latest_stats = {
     "max_temp": 0.0,
     "avg_temp": 0.0,
@@ -447,7 +467,46 @@ def log_data(timestamp, maxTemp, avgTemp,centerTemp, roiMax, roiAvg, riseRate, m
         writer = csv.writer(file) #create a CSV writer object to write data to the file
         writer.writerow([timestamp, maxTemp, avgTemp, centerTemp, roiMax, roiAvg, riseRate, maxTempFlag, runawayFlag]) #write a new row to the CSV file
 
+
+def plc_monitor_loop():
+    if not use_plc_flag:
+        return
+    previous_clear_status = None
+    while True: 
+        try:
+            print(f'Connecting to PLC...')
+            with LogixDriver(PLC_ADDRESS) as plc:
+                print("PLC Connected")
+                while True:
+                    result = plc.read(TAG)
+                    if result.error is not None:
+                        raise RuntimeError(f"Could not read {TAG}: {result.error}")
+                    robot_is_clear = (result.value==1)
+                    if robot_is_clear: 
+                        robot_clear_event.set()
+                    else:
+                        robot_clear_event.clear()
+                    if robot_is_clear != previous_clear_status:
+                        if robot_is_clear:
+                            print("PLC: Robot is CLEAR of the thermal camera zone.")
+                        else:
+                            print("PLC: Robot is OBSTRUCTING the thermal camera zone.")
+                        previous_clear_status = robot_is_clear
+                    time.sleep(PLC_CHECK_INTERVAL)
+        except Exception as error:
+            robot_clear_event.clear()
+            previous_clear_status = None
+            print(f"PLC Communication failed: {error}")
+            print("Thermal processing disabled.")
+            time.sleep(PLC_RECONNECT_INTERVAL)
+
 def camera_loop():
+
+    '''with LogixDriver(PLC_ADDRESS) as plc:
+        plc_status = plc.read(TAG)
+        print(f"{TAG} = {plc_status.value}")
+'''
+    #if (plc_status.value):
     global latest_frame, latest_stats, latest_combined_frame
     #global latest_projected_rgb_roi
     global latest_projected_rgb_hotspot
@@ -477,6 +536,10 @@ def camera_loop():
 
     while camera.isOpened():
         try:
+            if not robot_clear_event.is_set():
+                camera.grab() #fetch next frame from video stream, indicate T/F if success/fail
+                time.sleep(0.05)
+                continue
             ret, frame = camera.read()
             #print("Frame shape:", frame.shape, "dtype:", frame.dtype)
 
@@ -506,7 +569,10 @@ def camera_loop():
 
             # Full temp image (°C) per pixel
             temp_img = (raw_img.astype(np.float32) / 64.0) - 273.15
-            if not thermal_resolution_checked: 
+            #if not thermal_resolution_checked: 
+            #    validate_calibration_resolution(temp_img, "thermal")
+            #    thermal_resolution_checked = True
+            if use_RGB_flag and not thermal_resolution_checked:
                 validate_calibration_resolution(temp_img, "thermal")
                 thermal_resolution_checked = True
             # Max temp + location
@@ -594,11 +660,20 @@ def camera_loop():
                 normalized_temp,
                 cv2.COLORMAP_JET
             )
-            current_transform = (get_adjusted_thermal_to_rgb_matrix())
-            rgb_frame = rgb_camera.get_frame()
-            if rgb_frame is not None:
-                combined_display, warped_thermal = overlay_thermal_on_rgb(rgb_frame, heatmap_og, current_transform, alpha=THERMAL_OVERLAY_ALPHA)
-            else: combined_display=None
+           #current_transform = (get_adjusted_thermal_to_rgb_matrix())
+            #rgb_frame = rgb_camera.get_frame()
+            #if rgb_frame is not None:
+            #    combined_display, warped_thermal = overlay_thermal_on_rgb(rgb_frame, heatmap_og, current_transform, alpha=THERMAL_OVERLAY_ALPHA)
+            #else: combined_display=None
+
+            current_transform = None
+            combined_display = None
+            warped_thermal = None
+            if use_RGB_flag and rgb_camera is not None:
+                current_transform = get_adjusted_thermal_to_rgb_matrix()
+                rgb_frame = rgb_camera.get_frame()
+                if rgb_frame is not None and current_transform is not None:
+                    combined_display, warped_thermal = overlay_thermal_on_rgb(rgb_frame, heatmap_og, current_transform, alpha=THERMAL_OVERLAY_ALPHA)
 
             heatmap = cv2.resize(
                 heatmap_og,
@@ -650,13 +725,39 @@ def camera_loop():
             y2 = min(temp_img.shape[0], mrow + roi_half_height)
 
             #thermal_roi_polygon = np.float32([
-             #   [x1,y1],
-              #  [x2,y1],
-               # [x2,y2],
+            #   [x1,y1],
+            #  [x2,y1],
+            # [x2,y2],
                 #[x1,y2]
             #])
+
+            if (use_RGB_flag and current_transform is not None and combined_display is not None):
+                projected_rgb_hotspot = map_thermal_points_to_rgb([[mcol, mrow]], current_transform)[0]
+                projected_rgb_hotspot[0] += RGB_X_OFFSET
+                projected_rgb_hotspot[1] += RGB_Y_OFFSET
+
+                hot_x = int(round(projected_rgb_hotspot[0]))
+                hot_y = int(round(projected_rgb_hotspot[1]))
+
+                combined_height, combined_width = combined_display.shape[:2]
+
+                if(0 <= hot_x < combined_width and 0 <= hot_y < combined_height):
+                    rgb_x1 = max(0, hot_x - RGB_ROI_HALF_WIDTH)
+                    rgb_y1 = max(0, hot_y - RGB_ROI_HALF_HEIGHT)
+                    rgb_x2 = min(combined_width - 1, hot_x + RGB_ROI_HALF_WIDTH)
+                    rgb_y2 = min(combined_height - 1, hot_y + RGB_ROI_HALF_HEIGHT)
+                    cv2.rectangle(combined_display, (rgb_x1, rgb_y1),(rgb_x2, rgb_y2), (255, 255, 255), 3)
+                    cv2.drawMarker(combined_display, (hot_x, hot_y), color=(255,255,255), markerType = cv2.MARKER_CROSS, markerSize = 30, thickness = 3, line_type = cv2.LINE_AA)
+                    cv2.putText(combined_display, f"Hotspot: ({hot_x}, {hot_y})", (rgb_x1, max(rgb_y1 - 12, 25)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA) 
+                with projected_hotspot_lock:
+                    latest_projected_rgb_hotspot =(projected_rgb_hotspot.copy())
+            else:
+                with projected_hotspot_lock:
+                    latest_projected_rgb_hotspot=None
+
+
             #projected_rgb_roi = map_thermal_points_to_rgb(thermal_roi_polygon)
-            projected_rgb_hotspot = map_thermal_points_to_rgb([[mcol, mrow]], current_transform)[0]
+            '''projected_rgb_hotspot = map_thermal_points_to_rgb([[mcol, mrow]], current_transform)[0]
             projected_rgb_hotspot[0] += RGB_X_OFFSET
             projected_rgb_hotspot[1] += RGB_Y_OFFSET
             if combined_display is not None:
@@ -674,7 +775,7 @@ def camera_loop():
             with projected_hotspot_lock:
                 #latest_projected_rgb_roi=projected_rgb_roi.copy()
                 latest_projected_rgb_hotspot = (projected_rgb_hotspot.copy())
-
+            '''
 
             # Calculate statistics using ORIGINAL, unscaled coordinates
             stats = roi_stats(
@@ -757,10 +858,12 @@ def camera_loop():
                     last_graph_sample_time = current_time
 
             with frame_lock:
-                latest_frame = heatmap
-                if combined_display is not None:
-                    latest_combined_frame = combined_display.copy()
+                latest_frame = heatmap.copy()
                 latest_stats = dashboard_stats
+                if use_RGB_flag and combined_display is not None:
+                    latest_combined_frame = combined_display.copy()
+                else:
+                    latest_combined_frame = None
 
             log_data(sample_timestamp.isoformat(timespec="milliseconds"), dashboard_stats["max_temp"], dashboard_stats["avg_temp"], dashboard_stats["center_temp"], dashboard_stats["roi_max"], dashboard_stats["roi_avg"], dashboard_stats["rise_rate"], dashboard_stats["max_temp_warning"], dashboard_stats["thermal_runaway_warning"])
 
@@ -768,9 +871,14 @@ def camera_loop():
         except Exception as e:
             print("ERROR in camera_loop:", e)
             time.sleep(1)
+    #else:
+    #   print("PLC has indicated robot is obstructing camera view...Waiting for thermal frame")
 
 def generate_rgb_stream():
     while True:
+        if not use_RGB_flag or rgb_camera is None:
+            time.sleep(0.1)
+            continue
         jpeg = rgb_camera.get_jpeg()
         if jpeg is None:
             time.sleep(0.05)
@@ -960,29 +1068,8 @@ class RGBCamera:
                     line_type=cv2.LINE_AA
                 )
 
-                cv2.circle(
-                    frame,
-                    (hot_x, hot_y),
-                    6,
-                    (0, 0, 255),
-                    2,
-                    cv2.LINE_AA
-                )
-
-                cv2.putText(
-                    frame,
-                    "Projected thermal hotspot",
-                    (
-                        rgb_x1,
-                        max(rgb_y1 - 12, 25)
-                    ),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 0),
-                    2,
-                    cv2.LINE_AA
-                )
-
+                cv2.circle(frame,(hot_x, hot_y),6,(0, 0, 255),2,cv2.LINE_AA)
+                cv2.putText(frame,"Projected thermal hotspot",(rgb_x1,max(rgb_y1 - 12, 25)), cv2.FONT_HERSHEY_SIMPLEX,0.7,(0, 255, 0), 2,cv2.LINE_AA)
                 cv2.putText(
                     frame,
                     f"RGB: ({hot_x}, {hot_y})",
@@ -1045,7 +1132,7 @@ app.layout = html.Div([
             })],
             style={"flex":"1","minWidth":"350px"}
             ),
-        html.Div([html.H3("RGB Camera", style={"textAlign":"center"}), 
+        *([html.Div([html.H3("RGB Camera", style={"textAlign":"center"}), 
                   html.Img(
                       src="/rgb-video-feed",
                       style={
@@ -1059,7 +1146,10 @@ app.layout = html.Div([
                           "borderRadius":"6px"
                       }
                   )],
-                  style={"flex":"1","minWidth":"0"})],
+                  style={"flex":"1","minWidth":"0"})]
+                  if use_RGB_flag
+                  else []
+        )],
                   style={
                       "display": "flex",
                       "flexDirection": "row",
@@ -1067,8 +1157,8 @@ app.layout = html.Div([
                       "gap": "20px",
                       "width": "100%",
                       "flexWrap": "nowrap"
-                  }),
-    html.Div([
+                }),
+   ''' html.Div([
         html.H3("Thermal Overlay on RGB", style={"textAlign":"center"}),
         html.Img(
             src="/combined-video-feed",
@@ -1108,7 +1198,78 @@ app.layout = html.Div([
             style={
                 "marginTop":"15px",
                 "marginBottom":"25px"
-            }),
+            }),'''
+    *([html.Div([html.H3("Thermal Overlay on RGB", style={"textAlign":"center"}),
+                 html.Img(src="/combined-video-feed", 
+                          style={"width" : "100%",
+                                 "maxWidth": "1280px",
+                                 "height":"auto",
+                                 "maxHeight": "80vh",
+                                 "objectFit": "contain",
+                                 "display": "block",
+                                 "margin": "0 auto", 
+                                 "border": "2px solid #333",
+                                 "borderRadius":"6px"
+                 })]),
+                 html.Div([html.H4("Manual Thermal Overlay Alignment", style={"textAlign":"center"}),
+                           html.Div([html.Button("↑", id="overlay-move-up",n_clicks=0,
+                                                 style={
+                                                     "fontSize": "24px",
+                                                     "width": "60px",
+                                                     "height":"45px"
+                                                 })],
+                                                 style={
+                                                     "display":"flex",
+                                                     "justifyContent":"center",
+                                                     "marginBottom": "5px"
+                                                 }),
+                            html.Div([html.Button("←", id="overlay-move-left", n_clicks=0, 
+                                                  style={
+                                                      "fontSize": "24px",
+                                                      "width": "60px",
+                                                      "height": "45px",
+                                                  }
+                                                  ),
+                                    html.Button("Reset", id="overlay-reset-position", n_clicks=0, 
+                                                    style={
+                                                      "fontSize": "16px",
+                                                      "width" : "80px",
+                                                      "height": "45px"
+                                                  }),
+                                    html.Button("→", id="overlay-move-right", n_clicks=0,
+                                                style={
+                                                    "fontSize": "24px",
+                                                    "width": "60px",
+                                                    "height": "45px"
+                                                })
+                                            ],
+                                            style={
+                                                "display": "flex",
+                                                "justifyContent": "center",
+                                                "marginBottom": "5px"
+                                            }),
+                                html.Div([html.Button("↓", id="overlay-move-down", n_clicks=0,
+                                                      style={"fontSize": "24px",
+                                                             "width": "60px",
+                                                             "height": "45px"
+                                                             })],
+                                                style={
+                                                    "display": "flex",
+                                                    "justifyContent":"center"
+                                                }),
+                                html.Div(id="overlay-alignment-status", children = "Overlay offset: x=0px, y=0px",
+                                         style={
+                                             "textAlign": "center",
+                                             "marginTop": "10px",
+                                             "fontWeight": "bold"
+                                         })],
+                                    style={
+                                        "marginTop": "15px",
+                                        "marginBottom": "25px"
+                                    })]
+                                    if use_RGB_flag
+                                    else[]
+                                    ),
     html.Div(id="runaway_notification", style={"display":"none"}),
     html.Div([dcc.Button('Reset', id='reset-alarm-button', n_clicks = 0),
                   html.Span(id="reset-status", style={"marginLeft": "12px"}),],
@@ -1287,46 +1448,51 @@ def update_center_temperature_graph(n_intervals):
 
     return figure
 
-@app.callback(
-    Output("overlay-alignment-status","children"),
-    Input("overlay-move-up","n_clicks"),
-    Input("overlay-move-down","n_clicks"),
-    Input("overlay-move-left","n_clicks"),
-    Input("overlay-move-right","n_clicks"),
-    Input("overlay-reset-position","n_clicks"),
-    prevent_initial_call=True
-)
-
-def update_overlay_alignment(up_clicks, down_clicks, left_clicks, right_clicks, reset_clicks):
-    global overlay_x_offset
-    global overlay_y_offset
-    clicked_button = ctx.triggered_id
-    with overlay_alignment_lock:
-        if clicked_button == "overlay-move-up":
-            overlay_y_offset -= OVERLAY_MOVE_STEP
-        elif clicked_button == "overlay-move-down":
-            overlay_y_offset += OVERLAY_MOVE_STEP
-        elif clicked_button == "overlay-move-left":
-            overlay_x_offset -= OVERLAY_MOVE_STEP
-        elif clicked_button == "overlay-move-right":
-            overlay_x_offset += OVERLAY_MOVE_STEP
-        elif clicked_button == "overlay-reset-position":
-            overlay_x_offset=0
-            overlay_y_offset=0
-        current_x = overlay_x_offset
-        current_y = overlay_y_offset
-    clear_overlay_mask_cache()
-    return(f"Overlay offset: x = {current_x} px, y = {current_y} px")
+if use_RGB_flag:
+    @app.callback(
+        Output("overlay-alignment-status","children"),
+        Input("overlay-move-up","n_clicks"),
+        Input("overlay-move-down","n_clicks"),
+        Input("overlay-move-left","n_clicks"),
+        Input("overlay-move-right","n_clicks"),
+        Input("overlay-reset-position","n_clicks"),
+        prevent_initial_call=True
+    )
+    def update_overlay_alignment(up_clicks, down_clicks, left_clicks, right_clicks, reset_clicks):
+        global overlay_x_offset
+        global overlay_y_offset
+        clicked_button = ctx.triggered_id
+        with overlay_alignment_lock:
+            if clicked_button == "overlay-move-up":
+                overlay_y_offset -= OVERLAY_MOVE_STEP
+            elif clicked_button == "overlay-move-down":
+                overlay_y_offset += OVERLAY_MOVE_STEP
+            elif clicked_button == "overlay-move-left":
+                overlay_x_offset -= OVERLAY_MOVE_STEP
+            elif clicked_button == "overlay-move-right":
+                overlay_x_offset += OVERLAY_MOVE_STEP
+            elif clicked_button == "overlay-reset-position":
+                overlay_x_offset=0
+                overlay_y_offset=0
+            current_x = overlay_x_offset
+            current_y = overlay_y_offset
+        clear_overlay_mask_cache()
+        return(f"Overlay offset: x = {current_x} px, y = {current_y} px")
 
 
 if __name__ == '__main__':
     initialize_csv()
-    
-    rgb_camera = RGBCamera(camera_index=RGB_CAMERA_INDEX)
-    rgb_camera.start()
+    rgb_camera = None
+    if(use_RGB_flag):
+        rgb_camera = RGBCamera(camera_index=RGB_CAMERA_INDEX)
+        rgb_camera.start()
+    if (use_plc_flag):
+        plc_thread = threading.Thread(target=plc_monitor_loop, daemon=True)
+        plc_thread.start()
     camera_thread = threading.Thread(target=camera_loop, daemon=True)
     camera_thread.start()
     try:
         app.run(host="0.0.0.0", port=8050, debug=False)
     finally:
-        rgb_camera.stop()
+        if rgb_camera is not None:
+            rgb_camera.stop()
