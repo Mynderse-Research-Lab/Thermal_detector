@@ -23,7 +23,7 @@ from pycomm3 import LogixDriver
 #and partition and monitor the battery pack temperature
 MAX_RISE_C_PER_S = 2.0
 MAX_TEMP_THRESHOLD = 100
-THERMAL_CAMERA_INDEX=2
+THERMAL_CAMERA_INDEX=0
 RGB_CAMERA_INDEX=0
 THERMAL_OVERLAY_ALPHA = 0.45
 OVERLAY_MOVE_STEP = 5
@@ -34,7 +34,7 @@ STATUS_INTERVAL = 0.5
 last_status_time = 0.0
 CALIBRATION_FILE = (Path(__file__).resolve().parent / "dual-cam_transform-coord.json")
 
-use_RGB_flag = True #set to FALSE for thermal camera only output
+use_RGB_flag = False #set to FALSE for thermal camera only output
 
 use_plc_flag = False #SET THIS FLAG TO USE PLC ###################################################
 PLC_ADDRESS = "10.10.1.10"
@@ -1158,47 +1158,6 @@ app.layout = html.Div([
                       "width": "100%",
                       "flexWrap": "nowrap"
                 }),
-   ''' html.Div([
-        html.H3("Thermal Overlay on RGB", style={"textAlign":"center"}),
-        html.Img(
-            src="/combined-video-feed",
-            style={
-                "width": "100%",
-                "maxWidth": "1280px",
-                "height": "auto",
-                "maxHeight": "80vh",
-                "objectFit": "contain",
-                "display" : "block",
-                "margin": "0 auto",
-                "border": "2px solid #333",
-                "borderRadius" : "6px"
-            })]),
-    html.Div([
-        html.H4("Manual Thermal Overlay Alignment", style={"textAlign":"center"}),
-        html.Div([html.Button("↑", id="overlay-move-up", n_clicks = 0, style={"fontSize":"24px", "width":"60px", "height":"45px"})],
-                 style={
-                     "display":"flex",
-                     "justifyContent":"center",
-                     "marginBottom":"5px"
-                 }),
-        html.Div([html.Button("←", id="overlay-move-left", n_clicks = 0, style={"fontSize":"24px", "width":"60px", "height":"45px"}),
-                html.Button("Reset", id="overlay-reset-position", n_clicks=0, style={"fontSize":"16px","width":"80px","height":"45px"}),
-                html.Button("→", id="overlay-move-right", n_clicks = 0, style={"fontSize":"24px","width":"60px","height":"45px"})],
-                style={
-                    "display":"flex",
-                    "justifyContent":"center",
-                    "marginBottom":"5px"
-                }),
-    html.Div([html.Button("↓", id="overlay-move-down", n_clicks=0, style={"fontSize":"24px","width":"60px","height":"45px"})],
-              style={
-                  "display":"flex",
-                  "justifyContent":"center"
-              }),
-    html.Div(id="overlay-alignment-status", children="Overlay offset: x= 0 px, y= 0 px", style={"textAlign":"center", "marginTop":"10px", "fontWeight":"bold"})],
-            style={
-                "marginTop":"15px",
-                "marginBottom":"25px"
-            }),'''
     *([html.Div([html.H3("Thermal Overlay on RGB", style={"textAlign":"center"}),
                  html.Img(src="/combined-video-feed", 
                           style={"width" : "100%",
