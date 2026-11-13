@@ -18,6 +18,7 @@ import sys
 import math
 from pathlib import Path
 from pycomm3 import LogixDriver
+from rgb_init import *
 
 #this code is intended to recieve live camera input from a thermal camera and, based on the pack input from the user
 #and partition and monitor the battery pack temperature
@@ -36,7 +37,9 @@ CALIBRATION_FILE = (Path(__file__).resolve().parent / "dual-cam_transform-coord.
 
 use_RGB_flag = False #set to FALSE for thermal camera only output
 
-use_plc_flag = False #SET THIS FLAG TO USE PLC ###################################################
+use_plc_flag = True #SET THIS FLAG TO USE PLC ###################################################
+simulate_plc = True
+
 PLC_ADDRESS = "10.10.1.10"
 TAG = 'UN01R15_uRobot_1_IO.IN.DO73_ClrOfFix1'
 PLC_CHECK_INTERVAL = 0.2
@@ -44,6 +47,7 @@ PLC_RECONNECT_INTERVAL = 1.0
 robot_clear_event = threading.Event()
 if(use_plc_flag): #if we are using the PLC
     robot_clear_event.clear() #block processing until recieve go signal from PLC
+
 else: #if we are NOT using PLC
     robot_clear_event.set() #unblock processing completely
 
@@ -103,25 +107,7 @@ if (use_RGB_flag):
 else:
     print("RGB Camera Disabled. Running in thermal-only mode")
 
-def get_adjusted_thermal_to_rgb_matrix():
-    if not use_RGB_flag: return None
-    with overlay_alignment_lock:
-        x_offset = float(overlay_x_offset)
-        y_offset = float(overlay_y_offset)
-    translation_matrix = np.array([[1.0, 0.0, x_offset],[0.0,1.0,y_offset],[0.0,0.0,1.0]], dtype=np.float64)
-    adjusted_matrix = (translation_matrix @ base_thermal_to_rgb_matrix) #@ => matrix multiplication
-    return adjusted_matrix
 
-def overlay_thermal_on_rgb(rgb_frame, thermal_frame, thermal_to_rgb_matrix, alpha = THERMAL_OVERLAY_ALPHA):
-    rgb_height, rgb_width = rgb_frame.shape[:2]
-    warped_thermal = cv2.warpPerspective(thermal_frame, thermal_to_rgb_matrix, (rgb_width, rgb_height), flags=cv2.INTER_LINEAR)
-    thermal_mask = np.full(thermal_frame.shape[:2], 255, dtype=np.uint8)
-    warped_mask = cv2.warpPerspective(thermal_mask, thermal_to_rgb_matrix, (rgb_width, rgb_height), flags=cv2.INTER_NEAREST)
-    valid_pixels = warped_mask > 0
-    combined_frame = rgb_frame.copy()
-    blended = cv2.addWeighted(rgb_frame, 1.0-alpha, warped_thermal, alpha, 0)
-    combined_frame[valid_pixels] = blended[valid_pixels]
-    return combined_frame, warped_thermal
     
 def validate_calibration_resolution(frame, camera_name):
     coordinate_systems = (calibration_data.get("coord_sys", {}))
@@ -229,12 +215,7 @@ threshold = 2
 
 TEST_ROI = (100, 100, 200, 150)
 
-def map_thermal_points_to_rgb(thermal_points, transform_matrix=None):
-    if transform_matrix is None:
-        transform_matrix = (get_adjusted_thermal_to_rgb_matrix())
-    points = np.asarray(thermal_points, dtype=np.float32).reshape(-1,1,2)
-    rgb_points = cv2.perspectiveTransform(points, transform_matrix)
-    return rgb_points.reshape(-1,2)
+
 
 def detect_pack_region(img):
     #convert to grayscale
@@ -505,7 +486,7 @@ def camera_loop():
     '''with LogixDriver(PLC_ADDRESS) as plc:
         plc_status = plc.read(TAG)
         print(f"{TAG} = {plc_status.value}")
-'''
+    '''
     #if (plc_status.value):
     global latest_frame, latest_stats, latest_combined_frame
     #global latest_projected_rgb_roi
@@ -670,10 +651,10 @@ def camera_loop():
             combined_display = None
             warped_thermal = None
             if use_RGB_flag and rgb_camera is not None:
-                current_transform = get_adjusted_thermal_to_rgb_matrix()
+                current_transform = get_adjusted_thermal_to_rgb_matrix(use_RGB_flag, overlay_alignment_lock, overlay_x_offset, overlay_y_offset, base_thermal_to_rgb_matrix)
                 rgb_frame = rgb_camera.get_frame()
                 if rgb_frame is not None and current_transform is not None:
-                    combined_display, warped_thermal = overlay_thermal_on_rgb(rgb_frame, heatmap_og, current_transform, alpha=THERMAL_OVERLAY_ALPHA)
+                    combined_display, warped_thermal = overlay_thermal_on_rgb(rgb_frame, heatmap_og, current_transform, THERMAL_OVERLAY_ALPHA)
 
             heatmap = cv2.resize(
                 heatmap_og,
@@ -732,7 +713,7 @@ def camera_loop():
             #])
 
             if (use_RGB_flag and current_transform is not None and combined_display is not None):
-                projected_rgb_hotspot = map_thermal_points_to_rgb([[mcol, mrow]], current_transform)[0]
+                projected_rgb_hotspot = map_thermal_points_to_rgb([[mcol, mrow]], current_transform, use_RGB_flag, overlay_alignment_lock, overlay_x_offset, overlay_y_offset, base_thermal_to_rgb_matrix)[0]
                 projected_rgb_hotspot[0] += RGB_X_OFFSET
                 projected_rgb_hotspot[1] += RGB_Y_OFFSET
 
@@ -874,20 +855,7 @@ def camera_loop():
     #else:
     #   print("PLC has indicated robot is obstructing camera view...Waiting for thermal frame")
 
-def generate_rgb_stream():
-    while True:
-        if not use_RGB_flag or rgb_camera is None:
-            time.sleep(0.1)
-            continue
-        jpeg = rgb_camera.get_jpeg()
-        if jpeg is None:
-            time.sleep(0.05)
-            continue
-        yield(
-            b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n\r\n"+jpeg+b"\r\n"
-        )
-        time.sleep(0.03)
+
 
 def generate_video_stream():
     while True:
@@ -947,7 +915,7 @@ def video_feed():
 @server.route("/rgb-video-feed")
 def rgb_video_feed():
     return Response(
-        generate_rgb_stream(),
+        generate_rgb_stream(use_RGB_flag, rgb_camera),
         mimetype="multipart/x-mixed-replace; boundary=frame"
     )
 
@@ -1322,6 +1290,8 @@ def update_stats_display(n_intervals, pack_type):
 
     runaway_active = stats["thermal_runaway_warning"]
 
+    
+
     if runaway_active:
         notification_text = "THERMAL RUNAWAY ACTIVE - STOP"
         notification_style = {
@@ -1336,6 +1306,20 @@ def update_stats_display(n_intervals, pack_type):
             "border": "4px solid #5c000f",
             "borderRadius": "6px"
         }
+    elif use_plc_flag and not robot_clear_event.is_set():
+            notification_text = "WAITING FOR PLC SIGNAL"
+            notification_style = {
+                "display" : "block",
+                "backgroundColor": "#0072BC",
+                "color": "white",
+                "fontSize" : "24px",
+                "fontWeight":"bold",
+                "textAlign":"center",
+                "padding":"15px",
+                "marginBottom":"15px",
+                "border":"4px solid #003087",
+                "borderRadius":"6px"
+            }
     else:
         notification_text = ""
         notification_style = {"display": "none"}
@@ -1438,6 +1422,14 @@ if use_RGB_flag:
         clear_overlay_mask_cache()
         return(f"Overlay offset: x = {current_x} px, y = {current_y} px")
 
+def simulated_plc_loop():
+    while True:
+        robot_clear_event.clear()
+        print("PLC SIM: Waiting, robot NOT clear")
+        time.sleep(10)
+        robot_clear_event.set()
+        print("PLC SIM: Robot clear, procesing")
+        time.sleep(10)
 
 if __name__ == '__main__':
     initialize_csv()
@@ -1446,7 +1438,11 @@ if __name__ == '__main__':
         rgb_camera = RGBCamera(camera_index=RGB_CAMERA_INDEX)
         rgb_camera.start()
     if (use_plc_flag):
-        plc_thread = threading.Thread(target=plc_monitor_loop, daemon=True)
+        if simulate_plc:
+            plc_target = simulated_plc_loop
+        else:
+            plc_target = plc_monitor_loop
+        plc_thread = threading.Thread(target=plc_target, daemon=True)
         plc_thread.start()
     camera_thread = threading.Thread(target=camera_loop, daemon=True)
     camera_thread.start()
